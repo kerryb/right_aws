@@ -124,7 +124,11 @@ sudo gem install right_aws
 
 == LICENSE:
 
-Copyright (c) 2007-2008 RightScale, Inc. 
+Changes found at <http://github.com/jwilger/right_aws> are
+Copyright (c) 2008 John Wilger <johnwilger@gmail.com>
+
+Original code from <http://rubyforge.org/projects/rightaws> is
+Copyright (c) 2007-2008 RightScale, Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
