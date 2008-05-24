@@ -16,3 +16,4 @@ class TestCredentials
     end
   end
 end
+TestCredentials.get_credentials

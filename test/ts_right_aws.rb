@@ -1,7 +1,6 @@
 require 'test/unit'
 $: << File.dirname(__FILE__)
 require 'test_credentials'
-TestCredentials.get_credentials
 
 require 'http_connection'
 require 'awsbase/test_right_awsbase.rb'
