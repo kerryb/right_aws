@@ -30,3 +30,4 @@ test/sqs/test_right_sqs.rb
 test/sqs/test_right_sqs_gen2.rb
 test/test_credentials.rb
 test/ts_right_aws.rb
+test/awsbase/test_right_awsbase.rb
