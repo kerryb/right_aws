@@ -1,6 +1,7 @@
 class TestCredentials
   class << self
-    attr_accessor :aws_access_key_id, :aws_secret_access_key, :account_number
+    attr_accessor :aws_access_key_id, :aws_secret_access_key, :account_number,
+      :s3_test_bucket
 
     def get_credentials
       Dir.chdir do

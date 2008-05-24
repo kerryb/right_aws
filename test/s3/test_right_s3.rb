@@ -6,7 +6,7 @@ class TestS3 < Test::Unit::TestCase
   
   def setup
     @s3     = Rightscale::S3Interface.new(TestCredentials.aws_access_key_id, TestCredentials.aws_secret_access_key)
-    @bucket = 'right_s3_awesome_test_bucket_00001'
+    @bucket = TestCredentials.s3_test_bucket
     @key1   = 'test/woohoo1/'
     @key2   = 'test1/key/woohoo2'
     @key3   = 'test2/A%B@C_D&E?F+G=H"I'
