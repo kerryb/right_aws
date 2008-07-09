@@ -118,11 +118,30 @@ class TestSdb < Test::Unit::TestCase
     assert_equal items.first, @item
   end
   
-  def test_09_delete_domain
+  def test_09_signature_version_0 
+    sdb    = Rightscale::SdbInterface.new(TestCredentials.aws_access_key_id, TestCredentials.aws_secret_access_key, :signature_version => '0') 
+    item   = 'toys' 
+    # put attributes 
+    # mhhh... Not sure how to translate this: hÃ¶lzchehn klÃ¶tzchen grÃŒnspan buÃe... Lets assume this is:
+    attributes = { 'Jurgen' => %w{kitten puppy chickabiddy piglet} } 
+    assert sdb.put_attributes(@domain, item, attributes) 
+    wait SDB_DELAY, 'after putting attributes' 
+    # get attributes 
+    values = sdb.get_attributes(@domain, item)[:attributes]['Jurgen'].to_a.sort 
+    # compare to original list 
+    assert_equal values, attributes['Jurgen'].sort 
+    # check that the request has correct signature version
+    assert sdb.last_request.path.include?('SignatureVersion=0')
+  end 
+  
+  # Keep this test last, because it deletes the domain...
+  def test_10_delete_domain
     assert @sdb.delete_domain(@domain), 'delete_domain fail'
     wait SDB_DELAY, 'after domain deletion'
     # check that domain does not exist
     assert !@sdb.list_domains[:domains].include?(@domain)
   end
-
+  
+  
+  
 end

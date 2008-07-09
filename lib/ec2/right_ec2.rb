@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2007 RightScale Inc
+# Copyright (c) 2007-2008 RightScale Inc
 #
 # Permission is hereby granted, free of charge, to any person obtaining
 # a copy of this software and associated documentation files (the
@@ -66,10 +66,10 @@ module RightAws
   class Ec2 < RightAwsBase
     include RightAwsBaseInterface
     
-    SIGNATURE_VERSION = "1"
     # Amazon EC2 API version being used
     API_VERSION       = "2008-02-01"
     DEFAULT_HOST      = "ec2.amazonaws.com"
+    DEFAULT_PATH      = '/'
     DEFAULT_PROTOCOL  = 'https'
     DEFAULT_PORT      = 443
     
@@ -77,9 +77,10 @@ module RightAws
     DEFAULT_ADDRESSING_TYPE =  'public'
     DNS_ADDRESSING_SET      = ['public','direct']
     
+    # Amazon EC2 Instance Types : http://www.amazon.com/b?ie=UTF8&node=370375011
     # Default EC2 instance type (platform) 
     DEFAULT_INSTANCE_TYPE   =  'm1.small' 
-    INSTANCE_TYPES          = ['m1.small','m1.large','m1.xlarge'] 
+    INSTANCE_TYPES          = ['m1.small','c1.medium','m1.large','m1.xlarge','c1.xlarge']
     
     @@bench = AwsBenchmarkingBlock.new
     def self.bench_xml
@@ -103,11 +104,13 @@ module RightAws
     # * <tt>:protocol</tt>: 'http' or 'https', default: DEFAULT_PROTOCOL
     # * <tt>:multi_thread</tt>: true=HTTP connection per thread, false=per process
     # * <tt>:logger</tt>: for log messages, default: RAILS_DEFAULT_LOGGER else STDOUT
+    # * <tt>:signature_version</tt>:  The signature version : '0' or '1'(default)
     #
     def initialize(aws_access_key_id=nil, aws_secret_access_key=nil, params={})
       init({ :name             => 'EC2', 
              :default_host     => ENV['EC2_URL'] ? URI.parse(ENV['EC2_URL']).host   : DEFAULT_HOST, 
-             :default_port     => ENV['EC2_URL'] ? URI.parse(ENV['EC2_URL']).port   : DEFAULT_PORT, 
+             :default_port     => ENV['EC2_URL'] ? URI.parse(ENV['EC2_URL']).port   : DEFAULT_PORT,
+             :default_service  => ENV['EC2_URL'] ? URI.parse(ENV['EC2_URL']).path   : DEFAULT_PATH,             
              :default_protocol => ENV['EC2_URL'] ? URI.parse(ENV['EC2_URL']).scheme : DEFAULT_PROTOCOL }, 
            aws_access_key_id    || ENV['AWS_ACCESS_KEY_ID'] , 
            aws_secret_access_key|| ENV['AWS_SECRET_ACCESS_KEY'],
@@ -115,18 +118,21 @@ module RightAws
     end
 
 
-    def generate_request(action, param={}) #:nodoc:
-      timestamp    = ( Time::now ).utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-      request_hash = {"Action"            => action,
+    def generate_request(action, params={}) #:nodoc:
+      service_hash = {"Action"            => action,
                       "AWSAccessKeyId"    => @aws_access_key_id,
                       "Version"           => @@api,
-                      "Timestamp"         => timestamp,
-                      "SignatureVersion"  => SIGNATURE_VERSION }
-      request_hash.update(param)
-      request_data   = request_hash.sort{|a,b| (a[0].to_s.downcase)<=>(b[0].to_s.downcase)}.to_s
-      request_hash.update('Signature' =>  AwsUtils::sign(@aws_secret_access_key, request_data))
-      request_params = request_hash.to_a.collect{|key,val| key + "=" + CGI::escape(val) }.join("&")
-      request        = Net::HTTP::Get.new("/?#{request_params}")
+                      "Timestamp"         => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                      "SignatureVersion"  => signature_version }
+      service_hash.update(params)
+      # prepare string to sight
+      string_to_sign = case signature_version
+                       when '0' then service_hash["Action"] + service_hash["Timestamp"]
+                       when '1' then service_hash.sort{|a,b| (a[0].to_s.downcase)<=>(b[0].to_s.downcase)}.to_s
+                       end
+      service_hash.update('Signature' =>  AwsUtils::sign(@aws_secret_access_key, string_to_sign))
+      request_params = service_hash.to_a.collect{|key,val| key + "=" + CGI::escape(val) }.join("&")
+      request        = Net::HTTP::Get.new("#{@params[:service]}?#{request_params}")
         # prepare output hash
       { :request  => request, 
         :server   => @params[:server],
@@ -157,7 +163,7 @@ module RightAws
       update_cache(method.to_sym, :parsed => result) if use_cache
       result
     end
-    
+
     def hash_params(prefix, list) #:nodoc:
       groups = {}
       list.each_index{|i| groups.update("#{prefix}.#{i+1}"=>list[i])} if list
@@ -165,7 +171,7 @@ module RightAws
     end
 
   #-----------------------------------------------------------------
-  #-----------------------------------------------------------------
+  #      Images
   #-----------------------------------------------------------------
 
     def ec2_describe_images(list, list_by='ImageId', image_type=nil) #:nodoc:
@@ -345,6 +351,10 @@ module RightAws
       modify_image_attribute(image_id, 'productCodes', nil, :product_code => product_code.to_a)
     end
 
+  #-----------------------------------------------------------------
+  #      Instances
+  #-----------------------------------------------------------------
+    
     def get_desc_instances(instances)  # :nodoc:
       result = []
       instances.each do |reservation|
@@ -562,6 +572,10 @@ module RightAws
     rescue Exception
       on_exception
     end
+    
+  #-----------------------------------------------------------------
+  #      Security groups
+  #-----------------------------------------------------------------
 
       # Retrieve Security Group information. If +list+ is omitted the returns the whole list of groups.
       #
@@ -706,6 +720,10 @@ module RightAws
       on_exception
     end
 
+  #-----------------------------------------------------------------
+  #      Keys
+  #-----------------------------------------------------------------
+  
       # Retrieve a list of SSH keys. Returns an array of keys or an exception. Each key is
       # represented as a two-element hash.
       #
@@ -840,19 +858,18 @@ module RightAws
     rescue Exception
       on_exception
     end
+
+  
     
-  #- Internal stuff from here on down...
-
-
   #-----------------------------------------------------------------
   #      PARSERS: Boolean Response Parser
   #-----------------------------------------------------------------
     
-  class RightBoolResponseParser < RightAWSParser #:nodoc:
-    def tagend(name)
-      @result = @text=='true' ? true : false if name == 'return'
+    class RightBoolResponseParser < RightAWSParser #:nodoc:
+      def tagend(name)
+        @result = @text=='true' ? true : false if name == 'return'
+      end
     end
-  end
 
   #-----------------------------------------------------------------
   #      PARSERS: Key Pair
@@ -864,9 +881,9 @@ module RightAws
       end
       def tagend(name)
         case name 
-          when 'keyName'       : @item[:aws_key_name]    = @text
-          when 'keyFingerprint': @item[:aws_fingerprint] = @text
-          when 'item'          : @result                << @item
+          when 'keyName'        then @item[:aws_key_name]    = @text
+          when 'keyFingerprint' then @item[:aws_fingerprint] = @text
+          when 'item'           then @result                << @item
         end
       end
       def reset
@@ -880,9 +897,9 @@ module RightAws
       end
       def tagend(name)
         case name 
-          when 'keyName'       : @result[:aws_key_name]    = @text
-          when 'keyFingerprint': @result[:aws_fingerprint] = @text
-          when 'keyMaterial'   : @result[:aws_material]    = @text
+          when 'keyName'        then @result[:aws_key_name]    = @text
+          when 'keyFingerprint' then @result[:aws_fingerprint] = @text
+          when 'keyMaterial'    then @result[:aws_material]    = @text
         end
       end
     end
@@ -930,19 +947,19 @@ module RightAws
       end
       def tagend(name)
         case name
-          when 'ownerId'          ; @group.ownerId   = @text
-          when 'groupDescription' ; @group.groupDescription = @text
+          when 'ownerId'          then @group.ownerId   = @text
+          when 'groupDescription' then @group.groupDescription = @text
           when 'groupName'
             if @xmlpath=='DescribeSecurityGroupsResponse/securityGroupInfo/item'
               @group.groupName  = @text 
             elsif @xmlpath=='DescribeSecurityGroupsResponse/securityGroupInfo/item/ipPermissions/item/groups/item'
               @sgroup.groupName = @text 
             end
-          when 'ipProtocol'       ; @perm.ipProtocol = @text
-          when 'fromPort'         ; @perm.fromPort   = @text
-          when 'toPort'           ; @perm.toPort     = @text
-          when 'userId'           ; @sgroup.userId   = @text
-          when 'cidrIp'           ; @perm.ipRanges  << @text
+          when 'ipProtocol'       then @perm.ipProtocol = @text
+          when 'fromPort'         then @perm.fromPort   = @text
+          when 'toPort'           then @perm.toPort     = @text
+          when 'userId'           then @sgroup.userId   = @text
+          when 'cidrIp'           then @perm.ipRanges  << @text
           when 'item'
             if @xmlpath=='DescribeSecurityGroupsResponse/securityGroupInfo/item/ipPermissions/item/groups'
               @perm.groups << @sgroup
@@ -970,17 +987,17 @@ module RightAws
       end
       def tagend(name)
         case name
-          when 'imageId'       ; @image[:aws_id]       = @text
-          when 'imageLocation' ; @image[:aws_location] = @text
-          when 'imageState'    ; @image[:aws_state]    = @text
-          when 'imageOwnerId'  ; @image[:aws_owner]    = @text
-          when 'isPublic'      ; @image[:aws_is_public]= @text == 'true' ? true : false
-          when 'productCode'   ;(@image[:aws_product_codes] ||= []) << @text
-          when 'architecture'  ; @image[:aws_architecture] = @text
-          when 'imageType'     ; @image[:aws_image_type] = @text
-          when 'kernelId'      ; @image[:aws_kernel_id]  = @text
-          when 'ramdiskId'     ; @image[:aws_ramdisk_id] = @text
-          when 'item'          ; @result << @image if @xmlpath[%r{.*/imagesSet$}]
+          when 'imageId'       then @image[:aws_id]       = @text
+          when 'imageLocation' then @image[:aws_location] = @text
+          when 'imageState'    then @image[:aws_state]    = @text
+          when 'imageOwnerId'  then @image[:aws_owner]    = @text
+          when 'isPublic'      then @image[:aws_is_public]= @text == 'true' ? true : false
+          when 'productCode'   then (@image[:aws_product_codes] ||= []) << @text
+          when 'architecture'  then @image[:aws_architecture] = @text
+          when 'imageType'     then @image[:aws_image_type] = @text
+          when 'kernelId'      then @image[:aws_kernel_id]  = @text
+          when 'ramdiskId'     then @image[:aws_ramdisk_id] = @text
+          when 'item'          then @result << @image if @xmlpath[%r{.*/imagesSet$}]
         end
       end
       def reset
@@ -1013,13 +1030,13 @@ module RightAws
           # But nobody know what will they xml later as attribute. That is why we 
           # check for 'group' and 'userId' inside of 'launchPermission/item'
         case name
-          when 'imageId'            : @result[:aws_id] = @text
-          when 'group'              : @result[:groups] << @text if @xmlpath == 'DescribeImageAttributeResponse/launchPermission/item'
-          when 'userId'             : @result[:users]  << @text if @xmlpath == 'DescribeImageAttributeResponse/launchPermission/item'
-          when 'productCode'        : @result[:aws_product_codes] << @text
-          when 'kernel'             : @result[:aws_kernel]  = @text
-          when 'ramdisk'            : @result[:aws_ramdisk] = @text
-          when 'blockDeviceMapping' : @result[:block_device_mapping] = @text
+          when 'imageId'            then @result[:aws_id] = @text
+          when 'group'              then @result[:groups] << @text if @xmlpath == 'DescribeImageAttributeResponse/launchPermission/item'
+          when 'userId'             then @result[:users]  << @text if @xmlpath == 'DescribeImageAttributeResponse/launchPermission/item'
+          when 'productCode'        then @result[:aws_product_codes] << @text
+          when 'kernel'             then @result[:aws_kernel]  = @text
+          when 'ramdisk'            then @result[:aws_ramdisk] = @text
+          when 'blockDeviceMapping' then @result[:block_device_mapping] = @text
         end
       end
       def reset
@@ -1046,37 +1063,37 @@ module RightAws
                # RunInstances property
                 @xmlpath=='RunInstancesResponse/instancesSet' )
               # the optional params (sometimes are missing and we dont want them to be nil) 
-            @instance = { :aws_reason        => '',
-                          :dns_name          => '',
-                          :private_dns_name  => '',
-                          :ami_launch_index  => '',
-                          :ssh_key_name      => '',
-                          :aws_state         => '',
+            @instance = { :aws_reason       => '',
+                          :dns_name         => '',
+                          :private_dns_name => '',
+                          :ami_launch_index => '',
+                          :ssh_key_name     => '',
+                          :aws_state        => '',
                           :aws_product_codes => [] }
         end
       end
       def tagend(name)
         case name 
           # reservation
-          when 'reservationId'   : @reservation[:aws_reservation_id] = @text
-          when 'ownerId'         : @reservation[:aws_owner]          = @text
-          when 'groupId'         : @reservation[:aws_groups]        << @text
+          when 'reservationId'    then @reservation[:aws_reservation_id] = @text
+          when 'ownerId'          then @reservation[:aws_owner]          = @text
+          when 'groupId'          then @reservation[:aws_groups]        << @text
           # instance  
-          when 'instanceId'      : @instance[:aws_instance_id]    = @text
-          when 'imageId'         : @instance[:aws_image_id]       = @text
-          when 'dnsName'         : @instance[:dns_name]           = @text
-          when 'privateDnsName'  : @instance[:private_dns_name]   = @text
-          when 'reason'          : @instance[:aws_reason]         = @text
-          when 'keyName'         : @instance[:ssh_key_name]       = @text
-          when 'amiLaunchIndex'  : @instance[:ami_launch_index]   = @text
-          when 'code'            : @instance[:aws_state_code]     = @text
-          when 'name'            : @instance[:aws_state]          = @text
-          when 'productCode'     : @instance[:aws_product_codes] << @text
-          when 'instanceType'    : @instance[:aws_instance_type]  = @text
-          when 'launchTime'      : @instance[:aws_launch_time]    = @text
-          when 'kernelId'        : @instance[:aws_kernel_id]      = @text
-          when 'ramdiskId'       : @instance[:aws_ramdisk_id]     = @text
-          when 'availabilityZone': @instance[:aws_availability_zone] = @text
+          when 'instanceId'       then @instance[:aws_instance_id]    = @text
+          when 'imageId'          then @instance[:aws_image_id]       = @text
+          when 'dnsName'          then @instance[:dns_name]           = @text
+          when 'privateDnsName'   then @instance[:private_dns_name]   = @text
+          when 'reason'           then @instance[:aws_reason]         = @text
+          when 'keyName'          then @instance[:ssh_key_name]       = @text
+          when 'amiLaunchIndex'   then @instance[:ami_launch_index]   = @text
+          when 'code'             then @instance[:aws_state_code]     = @text
+          when 'name'             then @instance[:aws_state]          = @text
+          when 'productCode'      then @instance[:aws_product_codes] << @text
+          when 'instanceType'     then @instance[:aws_instance_type]  = @text
+          when 'launchTime'       then @instance[:aws_launch_time]    = @text
+          when 'kernelId'         then @instance[:aws_kernel_id]      = @text
+          when 'ramdiskId'        then @instance[:aws_ramdisk_id]     = @text
+          when 'availabilityZone' then @instance[:aws_availability_zone] = @text
           when 'item'
             if @xmlpath == 'DescribeInstancesResponse/reservationSet/item/instancesSet' || # DescribeInstances property
                @xmlpath == 'RunInstancesResponse/instancesSet'            # RunInstances property
@@ -1084,7 +1101,7 @@ module RightAws
             elsif @xmlpath=='DescribeInstancesResponse/reservationSet'    # DescribeInstances property
               @result << @reservation
             end
-          when 'RunInstancesResponse': @result << @reservation            # RunInstances property
+          when 'RunInstancesResponse' then @result << @reservation            # RunInstances property
         end
       end
       def reset
@@ -1104,7 +1121,7 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'instanceId' : @instance[:aws_instance_id] = @text
+        when 'instanceId' then @instance[:aws_instance_id] = @text
         when 'code'
           if @xmlpath == 'TerminateInstancesResponse/instancesSet/item/shutdownState'
                @instance[:aws_shutdown_state_code] = @text.to_i
@@ -1113,7 +1130,7 @@ module RightAws
           if @xmlpath == 'TerminateInstancesResponse/instancesSet/item/shutdownState'
                @instance[:aws_shutdown_state] = @text
           else @instance[:aws_prev_state]     = @text end
-        when 'item'       : @result << @instance
+        when 'item'       then @result << @instance
         end
       end
       def reset
@@ -1125,22 +1142,19 @@ module RightAws
   #      PARSERS: Console
   #-----------------------------------------------------------------
 
-
     class QEc2GetConsoleOutputParser < RightAWSParser #:nodoc:
       def tagend(name)
         case name
-        when 'instanceId' : @result[:aws_instance_id] = @text
-        when 'timestamp'  : @result[:aws_timestamp]   = @text
-                            @result[:timestamp]       = (Time.parse(@text)).utc
-        when 'output'     : @result[:aws_output]      = Base64.decode64(@text)
+        when 'instanceId' then @result[:aws_instance_id] = @text
+        when 'timestamp'  then @result[:aws_timestamp]   = @text
+                               @result[:timestamp]       = (Time.parse(@text)).utc
+        when 'output'     then @result[:aws_output]      = Base64.decode64(@text)
         end
       end
       def reset
         @result = {}
       end
     end
-
-  end
 
   #-----------------------------------------------------------------
   #      PARSERS: Fake
@@ -1171,9 +1185,9 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'instanceId' ; @address[:instance_id] = @text.blank? ? nil : @text 
-        when 'publicIp'   ; @address[:public_ip]   = @text
-        when 'item'       ; @result << @address
+        when 'instanceId' then @address[:instance_id] = @text.blank? ? nil : @text 
+        when 'publicIp'   then @address[:public_ip]   = @text
+        when 'item'       then @result << @address
         end
       end
       def reset
@@ -1191,14 +1205,18 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'zoneName'  ; @zone[:zone_name]  = @text
-        when 'zoneState' ; @zone[:zone_state] = @text
-        when 'item'      ; @result << @zone
+        when 'zoneName'  then @zone[:zone_name]  = @text
+        when 'zoneState' then @zone[:zone_state] = @text
+        when 'item'      then @result << @zone
         end
       end
       def reset
         @result = []
       end
     end
+
+ 
     
+  end
+      
 end

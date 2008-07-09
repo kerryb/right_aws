@@ -36,6 +36,7 @@ require 'right_http_connection'
 
 $:.unshift(File.dirname(__FILE__))
 require 'awsbase/benchmark_fix'
+require 'awsbase/file_fix'
 require 'awsbase/support'
 require 'awsbase/right_awsbase'
 require 'ec2/right_ec2'
@@ -52,7 +53,7 @@ module RightAws #:nodoc:
   module VERSION #:nodoc:
     MAJOR = 1
     MINOR = 7
-    TINY  = 1
+    TINY  = 2
 
     STRING = [MAJOR, MINOR, TINY].join('.')
   end
