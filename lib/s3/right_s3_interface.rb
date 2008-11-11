@@ -189,7 +189,7 @@ module RightAws
       unless headers[:location].blank?
         data = "<CreateBucketConfiguration><LocationConstraint>#{headers[:location].to_s.upcase}</LocationConstraint></CreateBucketConfiguration>"
       end
-      req_hash = generate_rest_request('PUT', headers.merge(:url=>bucket, :data => data))
+      req_hash = generate_rest_request('PUT', headers.merge(:url=>bucket, :data => data, 'content-length' => ((data && data.size) || 0).to_s))
       request_info(req_hash, S3TrueParser.new)
     rescue Exception => e
         # if the bucket exists AWS returns an error for the location constraint interface. Drop it
