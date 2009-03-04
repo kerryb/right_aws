@@ -115,7 +115,8 @@ module RightAws
       { :request  => request, 
         :server   => @params[:server],
         :port     => @params[:port],
-        :protocol => @params[:protocol] }
+        :protocol => @params[:protocol],
+        :proxy => @params[:proxy] }
     end
 
     def generate_post_request(action, param={})  # :nodoc:

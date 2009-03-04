@@ -100,7 +100,8 @@ module RightAws
       { :request  => request, 
         :server   => @params[:server],
         :port     => @params[:port],
-        :protocol => @params[:protocol] }
+        :protocol => @params[:protocol],
+        :proxy => @params[:proxy] }
     end
 
       # Generates a request hash for the REST API
