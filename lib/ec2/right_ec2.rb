@@ -122,7 +122,7 @@ module RightAws
       service_hash = {"Action"            => action,
                       "AWSAccessKeyId"    => @aws_access_key_id,
                       "Version"           => @@api,
-                      "Timestamp"         => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                      "Timestamp"         => Time.now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                       "SignatureVersion"  => signature_version }
       service_hash.update(params)
       # prepare string to sight
