@@ -120,7 +120,8 @@ module RightAws
       headers[:url].to_s[%r{^([a-z0-9._-]*)(/[^?]*)?(\?.+)?}i]
       bucket_name, key_path, params_list = $1, $2, $3
       # select request model
-      if is_dns_bucket?(bucket_name)
+      # No DNS
+      if is_dns_bucket?(bucket_name) and false
         # fix a path
         server = "#{bucket_name}.#{server}"
         key_path ||= '/'
@@ -155,12 +156,11 @@ module RightAws
         # set other headers
       request['Authorization'] = "AWS #{@aws_access_key_id}:#{signature}"
         # prepare output hash
-
       { :request  => request, 
         :server   => server,
         :port     => @params[:port],
         :protocol => @params[:protocol],
-        :proxy => @params[:proxy] }
+        :proxy    => @params[:proxy] }
       end
       
       # Sends request to Amazon and parses the response.

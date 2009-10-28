@@ -33,10 +33,13 @@ module RightAws
     DEFAULT_PORT      = 443
     DEFAULT_PROTOCOL  = 'https'
     API_VERSION       = '2007-11-07'
+    DEFAULT_NIL_REPRESENTATION = 'nil'
 
     @@bench = AwsBenchmarkingBlock.new
     def self.bench_xml; @@bench.xml;     end
     def self.bench_sdb; @@bench.service; end
+
+    attr_reader :last_query_expression
 
     # Creates new RightSdb instance.
     #
@@ -46,7 +49,8 @@ module RightAws
     #      :protocol     => 'https'              # Amazon service protocol: 'http' or 'https'(default)
     #      :signature_version => '0'             # The signature version : '0' or '1'(default)
     #      :multi_thread => true|false           # Multi-threaded (connection per each thread): true or false(default)
-    #      :logger       => Logger Object}       # Logger instance: logs to STDOUT if omitted }
+    #      :logger       => Logger Object        # Logger instance: logs to STDOUT if omitted 
+    #      :nil_representation => 'mynil'}       # interpret Ruby nil as this string value; i.e. use this string in SDB to represent Ruby nils (default is the string 'nil')
     #      
     # Example:
     # 
@@ -55,6 +59,8 @@ module RightAws
     # see: http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/
     #
     def initialize(aws_access_key_id=nil, aws_secret_access_key=nil, params={})
+      @nil_rep = params[:nil_representation] ? params[:nil_representation] : DEFAULT_NIL_REPRESENTATION
+      params.delete(:nil_representation)
       init({ :name             => 'SDB', 
              :default_host     => ENV['SDB_URL'] ? URI.parse(ENV['SDB_URL']).host   : DEFAULT_HOST, 
              :default_port     => ENV['SDB_URL'] ? URI.parse(ENV['SDB_URL']).port   : DEFAULT_PORT, 
@@ -69,38 +75,35 @@ module RightAws
     #-----------------------------------------------------------------
     def generate_request(action, params={}) #:nodoc:
       # remove empty params from request
-      params.delete_if {|key,value| value.blank? }
-      params_string  = params.to_a.collect{|key,val| key + "=#{CGI::escape(val.to_s)}" }.join("&")
+      params.delete_if {|key,value| value.nil? }
+      #params_string  = params.to_a.collect{|key,val| key + "=#{CGI::escape(val.to_s)}" }.join("&")
       # prepare service data
-      service_hash = {"Action"            => action,
-                      "AWSAccessKeyId"    => @aws_access_key_id,
-                      "Version"           => API_VERSION,
-                      "Timestamp"         => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                      "SignatureVersion"  => signature_version }
+      service = '/'
+      service_hash = {"Action"         => action,
+                      "AWSAccessKeyId" => @aws_access_key_id,
+                      "Version"        => API_VERSION }
       service_hash.update(params)
-      # prepare string to sight
-      string_to_sign = case signature_version
-                       when '0' : service_hash["Action"] + service_hash["Timestamp"]
-                       when '1' : service_hash.sort{|a,b| (a[0].to_s.downcase)<=>(b[0].to_s.downcase)}.to_s
-                       end
-      service_hash.update('Signature' =>  AwsUtils::sign(@aws_secret_access_key, string_to_sign))
-      service_string = service_hash.to_a.collect{|key,val| key + "=#{CGI::escape(val.to_s)}" }.join("&")
+      service_params = signed_service_params(@aws_secret_access_key, service_hash, :get, @params[:server], service)
       #
       # use POST method if the length of the query string is too large
       # see http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/MakingRESTRequests.html
-      if (service_string + params_string).size > 2000
-        request      = Net::HTTP::Post.new("/?#{service_string}")
-        request.body = params_string
+      if service_params.size > 2000
+        if signature_version == '2'
+          # resign the request because HTTP verb is included into signature
+          service_params = signed_service_params(@aws_secret_access_key, service_hash, :post, @params[:server], service)
+        end
+        request      = Net::HTTP::Post.new(service)
+        request.body = service_params
+        request['Content-Type'] = 'application/x-www-form-urlencoded'
       else
-        params_string = "&#{params_string}" unless params_string.blank?
-        request       = Net::HTTP::Get.new("/?#{service_string}#{params_string}")
+        request = Net::HTTP::Get.new("#{service}?#{service_params}")
       end
       # prepare output hash
       { :request  => request, 
         :server   => @params[:server],
         :port     => @params[:port],
         :protocol => @params[:protocol],
-        :proxy => @params[:proxy] }
+        :proxy    => @params[:proxy] }
     end
 
     # Sends request to Amazon and parses the response
@@ -117,18 +120,20 @@ module RightAws
       result = {}
       if attributes
         idx = 0
+        skip_values = attributes.is_a?(Array)
         attributes.each do |attribute, values|
           # set replacement attribute
           result["Attribute.#{idx}.Replace"] = 'true' if replace
           # pack Name/Value
-          unless values.blank?
-            values.to_a.each do |value|
+          unless values.nil?
+            Array(values).each do |value|
               result["Attribute.#{idx}.Name"]  = attribute
-              result["Attribute.#{idx}.Value"] = value 
+              result["Attribute.#{idx}.Value"] = ruby_to_sdb(value) unless skip_values
               idx += 1
             end
           else
             result["Attribute.#{idx}.Name"] = attribute
+            result["Attribute.#{idx}.Value"] = ruby_to_sdb(nil) unless skip_values
             idx += 1
           end
         end
@@ -145,22 +150,55 @@ module RightAws
       %Q{'#{value.to_s.gsub(/(['\\])/){ "\\#{$1}" }}'} if value
     end
     
+    # Convert a Ruby language value to a SDB value by replacing Ruby nil with the user's chosen string representation of nil.
+    # Non-nil values are unaffected by this filter.
+    def ruby_to_sdb(value)
+      value.nil? ? @nil_rep : value
+    end
+    
+    # Convert a SDB value to a Ruby language value by replacing the user's chosen string representation of nil with Ruby nil.
+    # Values are unaffected by this filter unless they match the nil representation exactly.
+    def sdb_to_ruby(value)
+      value.eql?(@nil_rep) ? nil : value
+    end
+
+    # Convert select and query_with_attributes responses to a Ruby language values by replacing the user's chosen string representation of nil with Ruby nil.
+    # (This method affects on a passed response value)
+    def select_response_to_ruby(response) #:nodoc:
+      response[:items].each_with_index do |item, idx|
+        item.each do |key, attributes|
+          attributes.each do |name, values|
+            values.collect! { |value| sdb_to_ruby(value) }
+          end
+        end
+      end
+      response
+    end
+
     # Create query expression from an array.
     # (similar to ActiveRecord::Base#find using :conditions => ['query', param1, .., paramN])
     #
     def query_expression_from_array(params) #:nodoc:
-      unless params.blank?
-        query = params.shift.to_s
-        query.gsub(/(\\)?(\?)/) do
-          if $1 # if escaped '\?' is found - replace it by '?' without backslash
-            "?"
-          else  # well, if no backslash precedes '?' then replace it by next param from the list
-            escape(params.shift)
-          end
+      return '' if params.blank?
+      query = params.shift.to_s
+      query.gsub(/(\\)?(\?)/) do
+        if $1 # if escaped '\?' is found - replace it by '?' without backslash
+          "?"
+        else  # well, if no backslash precedes '?' then replace it by next param from the list
+          escape(params.shift)
         end
       end
     end
-    
+
+    def query_expression_from_hash(hash)
+      return '' if hash.blank?
+      expression = []
+      hash.each do |key, value|
+        expression << "#{key}=#{escape(value)}"
+      end
+      expression.join(' AND ')
+    end
+
     # Retrieve a list of SDB domains from Amazon.
     # 
     # Returns a hash:
@@ -325,7 +363,11 @@ module RightAws
       link = generate_request("GetAttributes", 'DomainName'    => domain_name,
                                                'ItemName'      => item_name,
                                                'AttributeName' => attribute_name )
-      request_info(link, QSdbGetAttributesParser.new)
+      res = request_info(link, QSdbGetAttributesParser.new)
+      res[:attributes].each_value do |values|
+        values.collect! { |e| sdb_to_ruby(e) }
+      end
+      res
     rescue Exception
       on_exception
     end
@@ -386,10 +428,15 @@ module RightAws
     #   query = [ "['cat'=?] union ['dog'=?]", "clew", "Jon's boot" ]
     #   sdb.query('family', query)
     #
+    #   query = [ "['cat'=?] union ['dog'=?] sort 'cat' desc", "clew", "Jon's boot" ]
+    #   sdb.query('family', query)
+    #
     # see: http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/SDB_API_Query.html
+    #      http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?SortingData.html
     #
     def query(domain_name, query_expression = nil, max_number_of_items = nil, next_token = nil)
       query_expression = query_expression_from_array(query_expression) if query_expression.is_a?(Array)
+      @last_query_expression = query_expression
       #
       request_params = { 'DomainName'       => domain_name,
                          'QueryExpression'  => query_expression,
@@ -412,6 +459,137 @@ module RightAws
       on_exception
     end
     
+    # Perform a query and fetch specified attributes.
+    # If attributes are not specified then fetches the whole list of attributes.
+    #
+    #
+    # Returns a hash:
+    #   { :box_usage  => string,
+    #     :request_id => string,
+    #     :next_token => string,
+    #     :items      => [ { ItemName1 => { attribute1 => value1, ...  attributeM => valueM } },
+    #                      { ItemName2 => {...}}, ... ]
+    #
+    # Example:
+    #
+    #   sdb.query_with_attributes(domain, ['hobby', 'country'], "['gender'='female'] intersection ['name' starts-with ''] sort 'name'") #=>
+    #     { :request_id => "06057228-70d0-4487-89fb-fd9c028580d3",
+    #       :items =>
+    #         [ { "035f1ba8-dbd8-11dd-80bd-001bfc466dd7"=>
+    #             { "hobby"   => ["cooking", "flowers", "cats"],
+    #               "country" => ["Russia"]}},
+    #           { "0327614a-dbd8-11dd-80bd-001bfc466dd7"=>
+    #             { "hobby"   => ["patchwork", "bundle jumping"],
+    #               "country" => ["USA"]}}, ... ],
+    #        :box_usage=>"0.0000504786"}
+    #
+    #   sdb.query_with_attributes(domain, [], "['gender'='female'] intersection ['name' starts-with ''] sort 'name'") #=>
+    #     { :request_id => "75bb19db-a529-4f69-b86f-5e3800f79a45",
+    #       :items =>
+    #       [ { "035f1ba8-dbd8-11dd-80bd-001bfc466dd7"=>
+    #           { "hobby"   => ["cooking", "flowers", "cats"],
+    #             "name"    => ["Mary"],
+    #             "country" => ["Russia"],
+    #             "gender"  => ["female"],
+    #             "id"      => ["035f1ba8-dbd8-11dd-80bd-001bfc466dd7"]}},
+    #         { "0327614a-dbd8-11dd-80bd-001bfc466dd7"=>
+    #           { "hobby"   => ["patchwork", "bundle jumping"],
+    #             "name"    => ["Mary"],
+    #             "country" => ["USA"],
+    #             "gender"  => ["female"],
+    #             "id"      => ["0327614a-dbd8-11dd-80bd-001bfc466dd7"]}}, ... ],
+    #      :box_usage=>"0.0000506668"}
+    #
+    # see: http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?SDB_API_QueryWithAttributes.html
+    #
+    def query_with_attributes(domain_name, attributes=[], query_expression = nil, max_number_of_items = nil, next_token = nil)
+      attributes = attributes.to_a
+      query_expression = query_expression_from_array(query_expression) if query_expression.is_a?(Array)
+      @last_query_expression = query_expression
+      #
+      request_params = { 'DomainName'       => domain_name,
+                         'QueryExpression'  => query_expression,
+                         'MaxNumberOfItems' => max_number_of_items,
+                         'NextToken'        => next_token }
+      attributes.each_with_index do |attribute, idx|
+        request_params["AttributeName.#{idx+1}"] = attribute
+      end
+      link   = generate_request("QueryWithAttributes", request_params)
+      result = select_response_to_ruby(request_info( link, QSdbQueryWithAttributesParser.new ))
+      # return result if no block given
+      return result unless block_given?
+      # loop if block if given
+      begin
+        # the block must return true if it wanna continue
+        break unless yield(result) && result[:next_token]
+        # make new request
+        request_params['NextToken'] = result[:next_token]
+        link   = generate_request("QueryWithAttributes", request_params)
+        result = select_response_to_ruby(request_info( link, QSdbQueryWithAttributesParser.new ))
+      end while true
+    rescue Exception
+      on_exception
+    end
+
+    # Perform SQL-like select and fetch attributes.
+    # Attribute values must be quoted with a single or double quote. If a quote appears within the attribute value, it must be escaped with the same quote symbol as shown in the following example.
+    # (Use array to pass select_expression params to avoid manual escaping).
+    #
+    #  sdb.select(["select * from my_domain where gender=?", 'female']) #=>
+    #    {:request_id =>"8241b843-0fb9-4d66-9100-effae12249ec",
+    #     :items =>
+    #      [ { "035f1ba8-dbd8-11dd-80bd-001bfc466dd7"=>
+    #          {"hobby"   => ["cooking", "flowers", "cats"],
+    #           "name"    => ["Mary"],
+    #           "country" => ["Russia"],
+    #           "gender"  => ["female"],
+    #           "id"      => ["035f1ba8-dbd8-11dd-80bd-001bfc466dd7"]}},
+    #        { "0327614a-dbd8-11dd-80bd-001bfc466dd7"=>
+    #          {"hobby"   => ["patchwork", "bundle jumping"],
+    #           "name"    => ["Mary"],
+    #           "country" => ["USA"],
+    #           "gender"  => ["female"],
+    #           "id"      => ["0327614a-dbd8-11dd-80bd-001bfc466dd7"]}}, ... ]
+    #     :box_usage =>"0.0000506197"}
+    #
+    #   sdb.select('select country, name from my_domain') #=>
+    #    {:request_id=>"b1600198-c317-413f-a8dc-4e7f864a940a",
+    #     :items=>
+    #      [ { "035f1ba8-dbd8-11dd-80bd-001bfc466dd7"=> {"name"=>["Mary"],     "country"=>["Russia"]} },
+    #        { "376d2e00-75b0-11dd-9557-001bfc466dd7"=> {"name"=>["Putin"],    "country"=>["Russia"]} },
+    #        { "0327614a-dbd8-11dd-80bd-001bfc466dd7"=> {"name"=>["Mary"],     "country"=>["USA"]}    },
+    #        { "372ebbd4-75b0-11dd-9557-001bfc466dd7"=> {"name"=>["Bush"],     "country"=>["USA"]}    },
+    #        { "37a4e552-75b0-11dd-9557-001bfc466dd7"=> {"name"=>["Medvedev"], "country"=>["Russia"]} },
+    #        { "38278dfe-75b0-11dd-9557-001bfc466dd7"=> {"name"=>["Mary"],     "country"=>["Russia"]} },
+    #        { "37df6c36-75b0-11dd-9557-001bfc466dd7"=> {"name"=>["Mary"],     "country"=>["USA"]}    } ],
+    #     :box_usage=>"0.0000777663"}
+    #
+    # see: http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?SDB_API_Select.html
+    #      http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?UsingSelect.html
+    #      http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?SDBLimits.html
+    #
+    def select(select_expression, next_token = nil)
+      select_expression      = query_expression_from_array(select_expression) if select_expression.is_a?(Array)
+      @last_query_expression = select_expression
+      #
+      request_params = { 'SelectExpression' => select_expression,
+                         'NextToken'        => next_token }
+      link   = generate_request("Select", request_params)
+      result = select_response_to_ruby(request_info( link, QSdbSelectParser.new ))
+      return result unless block_given?
+      # loop if block if given
+      begin
+        # the block must return true if it wanna continue
+        break unless yield(result) && result[:next_token]
+        # make new request
+        request_params['NextToken'] = result[:next_token]
+        link   = generate_request("Select", request_params)
+        result = select_response_to_ruby(request_info( link, QSdbSelectParser.new ))
+      end while true
+    rescue Exception
+      on_exception
+    end
+
     #-----------------------------------------------------------------
     #      PARSERS:
     #-----------------------------------------------------------------
@@ -421,10 +599,10 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'NextToken'  : @result[:next_token] =  @text
-        when 'DomainName' : @result[:domains]    << @text
-        when 'BoxUsage'   : @result[:box_usage]  =  @text
-        when 'RequestId'  : @result[:request_id] =  @text
+        when 'NextToken'  then @result[:next_token] =  @text
+        when 'DomainName' then @result[:domains]    << @text
+        when 'BoxUsage'   then @result[:box_usage]  =  @text
+        when 'RequestId'  then @result[:request_id] =  @text
         end
       end
     end
@@ -435,8 +613,8 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'BoxUsage'   : @result[:box_usage]  =  @text
-        when 'RequestId'  : @result[:request_id] =  @text
+        when 'BoxUsage'  then @result[:box_usage]  =  @text
+        when 'RequestId' then @result[:request_id] =  @text
         end
       end
     end
@@ -448,10 +626,10 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'Name'       : @last_attribute_name = @text
-        when 'Value'      : (@result[:attributes][@last_attribute_name] ||= []) << @text
-        when 'BoxUsage'   : @result[:box_usage]  =  @text
-        when 'RequestId'  : @result[:request_id] =  @text
+        when 'Name'      then @last_attribute_name = @text
+        when 'Value'     then (@result[:attributes][@last_attribute_name] ||= []) << @text
+        when 'BoxUsage'  then @result[:box_usage]  =  @text
+        when 'RequestId' then @result[:request_id] =  @text
         end
       end
     end
@@ -462,10 +640,56 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'ItemName'   : @result[:items]      << @text
-        when 'BoxUsage'   : @result[:box_usage]  =  @text
-        when 'RequestId'  : @result[:request_id] =  @text
-        when 'NextToken'  : @result[:next_token] =  @text
+        when 'ItemName'  then @result[:items]      << @text
+        when 'BoxUsage'  then @result[:box_usage]  =  @text
+        when 'RequestId' then @result[:request_id] =  @text
+        when 'NextToken' then @result[:next_token] =  @text
+        end
+      end
+    end
+
+    class QSdbQueryWithAttributesParser < RightAWSParser #:nodoc:
+      def reset
+        @result = { :items => [] }
+      end
+      def tagend(name)
+        case name
+        when 'Name'
+          case @xmlpath
+          when 'QueryWithAttributesResponse/QueryWithAttributesResult/Item'
+            @item = @text
+            @result[:items] << { @item => {} }
+          when 'QueryWithAttributesResponse/QueryWithAttributesResult/Item/Attribute'
+            @attribute = @text
+            @result[:items].last[@item][@attribute] ||= []
+          end
+        when 'RequestId' then @result[:request_id] = @text
+        when 'BoxUsage'  then @result[:box_usage]  = @text
+        when 'NextToken' then @result[:next_token] = @text
+        when 'Value'     then @result[:items].last[@item][@attribute] << @text
+        end
+      end
+    end
+
+    class QSdbSelectParser < RightAWSParser #:nodoc:
+      def reset
+        @result = { :items => [] }
+      end
+      def tagend(name)
+        case name
+        when 'Name'
+          case @xmlpath
+          when 'SelectResponse/SelectResult/Item'
+            @item = @text
+            @result[:items] << { @item => {} }
+          when 'SelectResponse/SelectResult/Item/Attribute'
+            @attribute = @text
+            @result[:items].last[@item][@attribute] ||= []
+          end
+        when 'RequestId' then @result[:request_id] = @text
+        when 'BoxUsage'  then @result[:box_usage]  = @text
+        when 'NextToken' then @result[:next_token] = @text
+        when 'Value'     then @result[:items].last[@item][@attribute] << @text
         end
       end
     end

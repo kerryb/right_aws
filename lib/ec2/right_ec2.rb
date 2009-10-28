@@ -25,7 +25,8 @@ module RightAws
 
   # = RightAWS::EC2 -- RightScale Amazon EC2 interface
   # The RightAws::EC2 class provides a complete interface to Amazon's
-  # Elastic Compute Cloud service.
+  # Elastic Compute Cloud service, as well as the associated EBS (Elastic Block
+  # Store).
   # For explanations of the semantics
   # of each call, please refer to Amazon's documentation at
   # http://developer.amazonwebservices.com/connect/kbcategory.jspa?categoryID=87
@@ -67,7 +68,7 @@ module RightAws
     include RightAwsBaseInterface
     
     # Amazon EC2 API version being used
-    API_VERSION       = "2008-02-01"
+    API_VERSION       = "2009-04-04"
     DEFAULT_HOST      = "ec2.amazonaws.com"
     DEFAULT_PATH      = '/'
     DEFAULT_PROTOCOL  = 'https'
@@ -99,12 +100,18 @@ module RightAws
     # Create a new handle to an EC2 account. All handles share the same per process or per thread
     # HTTP connection to Amazon EC2. Each handle is for a specific account. The params have the
     # following options:
+    # * <tt>:endpoint_url</tt> a fully qualified url to Amazon API endpoint (this overwrites: :server, :port, :service, :protocol and :region). Example: 'https://eu-west-1.ec2.amazonaws.com/'
     # * <tt>:server</tt>: EC2 service host, default: DEFAULT_HOST
+    # * <tt>:region</tt>: EC2 region (North America by default)
     # * <tt>:port</tt>: EC2 service port, default: DEFAULT_PORT
     # * <tt>:protocol</tt>: 'http' or 'https', default: DEFAULT_PROTOCOL
     # * <tt>:multi_thread</tt>: true=HTTP connection per thread, false=per process
     # * <tt>:logger</tt>: for log messages, default: RAILS_DEFAULT_LOGGER else STDOUT
     # * <tt>:signature_version</tt>:  The signature version : '0' or '1'(default)
+    # * <tt>:cache</tt>: true/false: caching for: ec2_describe_images, describe_instances,
+    # describe_images_by_owner, describe_images_by_executable_by, describe_availability_zones,
+    # describe_security_groups, describe_key_pairs, describe_addresses, 
+    # describe_volumes, describe_snapshots methods, default: false.
     #
     def initialize(aws_access_key_id=nil, aws_secret_access_key=nil, params={})
       init({ :name             => 'EC2', 
@@ -115,31 +122,41 @@ module RightAws
            aws_access_key_id    || ENV['AWS_ACCESS_KEY_ID'] , 
            aws_secret_access_key|| ENV['AWS_SECRET_ACCESS_KEY'],
            params)
+      # EC2 doesn't really define any transient errors to retry, and in fact,
+      # when they return a 503 it is usually for 'request limit exceeded' which
+      # we most certainly should not retry.  So let's pare down the list of
+      # retryable errors to InternalError only (see RightAwsBase for the default
+      # list)
+      amazon_problems = ['InternalError']
     end
 
 
     def generate_request(action, params={}) #:nodoc:
-      service_hash = {"Action"            => action,
-                      "AWSAccessKeyId"    => @aws_access_key_id,
-                      "Version"           => @@api,
-                      # MODIFIED: from Time.now.utc.stf... for eucalyptus
-                      "Timestamp"         => Time.now.strftime("%Y-%m-%dT%H:%M:%S.000Z"), 
-                      "SignatureVersion"  => signature_version }
+      service_hash = {"Action"         => action,
+                      "AWSAccessKeyId" => @aws_access_key_id,
+                      "Version"        => @@api }
       service_hash.update(params)
-      # prepare string to sight
-      string_to_sign = case signature_version
-                       when '0' then service_hash["Action"] + service_hash["Timestamp"]
-                       when '1' then service_hash.sort{|a,b| (a[0].to_s.downcase)<=>(b[0].to_s.downcase)}.to_s
-                       end
-      service_hash.update('Signature' =>  AwsUtils::sign(@aws_secret_access_key, string_to_sign))
-      request_params = service_hash.to_a.collect{|key,val| key + "=" + CGI::escape(val) }.join("&")
-      request        = Net::HTTP::Get.new("#{@params[:service]}?#{request_params}")
+      service_params = signed_service_params(@aws_secret_access_key, service_hash, :get, @params[:server], @params[:service])
+      
+      # use POST method if the length of the query string is too large
+      if service_params.size > 2000
+        if signature_version == '2'
+          # resign the request because HTTP verb is included into signature
+          service_params = signed_service_params(@aws_secret_access_key, service_hash, :post, @params[:server], @params[:service])
+        end
+        request      = Net::HTTP::Post.new(service)
+        request.body = service_params
+        request['Content-Type'] = 'application/x-www-form-urlencoded'
+      else
+        request        = Net::HTTP::Get.new("#{@params[:service]}?#{service_params}")
+      end
         # prepare output hash
       { :request  => request, 
         :server   => @params[:server],
         :port     => @params[:port],
         :protocol => @params[:protocol],
-        :proxy => @params[:proxy] }
+        :proxy    => @params[:proxy] }
+
     end
 
       # Sends request to Amazon and parses the response
@@ -148,22 +165,6 @@ module RightAws
       thread = @params[:multi_thread] ? Thread.current : Thread.main
       thread[:ec2_connection] ||= Rightscale::HttpConnection.new(:exception => AwsError, :logger => @logger)
       request_info_impl(thread[:ec2_connection], @@bench, request, parser)
-    end
-
-    def request_cache_or_info(method, link, parser_class, use_cache=true) #:nodoc:
-      # We do not want to break the logic of parsing hence will use a dummy parser to process all the standart 
-      # steps (errors checking etc). The dummy parser does nothig - just returns back the params it received.
-      # If the caching is enabled and hit then throw  AwsNoChange. 
-      # P.S. caching works for the whole images list only! (when the list param is blank)      response, params = request_info(link, QEc2DummyParser.new)
-      # check cache
-      response, params = request_info(link, QEc2DummyParser.new)
-      cache_hits?(method.to_sym, response.body) if use_cache
-      parser = parser_class.new(:logger => @logger)
-      @@bench.xml.add!{ parser.parse(response, params) }
-      result = block_given? ? yield(parser) : parser.result
-      # update parsed data
-      update_cache(method.to_sym, :parsed => result) if use_cache
-      result
     end
 
     def hash_params(prefix, list) #:nodoc:
@@ -176,11 +177,19 @@ module RightAws
   #      Images
   #-----------------------------------------------------------------
 
-    def ec2_describe_images(list, list_by='ImageId', image_type=nil) #:nodoc:
-      request_hash = hash_params(list_by, list.to_a)
+    # params: 
+    #   { 'ImageId'      => ['id1', ..., 'idN'],
+    #     'Owner'        => ['self', ..., 'userN'],
+    #     'ExecutableBy' => ['self', 'all', ..., 'userN']
+    #   } 
+    def ec2_describe_images(params={}, image_type=nil, cache_for=nil) #:nodoc:
+      request_hash = {}
+      params.each do |list_by, list|
+        request_hash.merge! hash_params(list_by, list.to_a)
+      end
       request_hash['ImageType'] = image_type if image_type
       link = generate_request("DescribeImages", request_hash)
-      request_cache_or_info :describe_images, link,  QEc2DescribeImagesParser, (list.blank? && list_by == 'ImageId' && image_type.blank?)
+      request_cache_or_info cache_for, link,  QEc2DescribeImagesParser, @@bench, cache_for
     rescue Exception
       on_exception
     end
@@ -211,7 +220,9 @@ module RightAws
       #      :aws_image_type => "machine"}]
       #
     def describe_images(list=[], image_type=nil)
-      ec2_describe_images(list, 'ImageId', image_type)
+      list = list.to_a
+      cache_for = list.empty? && !image_type ? :describe_images : nil
+      ec2_describe_images({ 'ImageId' => list }, image_type, cache_for)
     end
 
       #
@@ -220,8 +231,10 @@ module RightAws
       #   ec2.describe_images_by_owner('522821470517')
       #   ec2.describe_images_by_owner('self')
       #
-    def describe_images_by_owner(list, image_type=nil)
-      ec2_describe_images(list, 'Owner', image_type)
+    def describe_images_by_owner(list=['self'], image_type=nil)
+      list = list.to_a
+      cache_for = list==['self'] && !image_type ? :describe_images_by_owner : nil
+      ec2_describe_images({ 'Owner' => list }, image_type, cache_for)
     end
 
       #
@@ -229,9 +242,12 @@ module RightAws
       #
       #   ec2.describe_images_by_executable_by('522821470517')
       #   ec2.describe_images_by_executable_by('self')
+      #   ec2.describe_images_by_executable_by('all')
       #
-    def describe_images_by_executable_by(list, image_type=nil)
-      ec2_describe_images(list, 'ExecutableBy', image_type)
+    def describe_images_by_executable_by(list=['self'], image_type=nil)
+      list = list.to_a
+      cache_for = list==['self'] && !image_type ? :describe_images_by_executable_by : nil
+      ec2_describe_images({ 'ExecutableBy' => list }, image_type, cache_for)
     end
 
 
@@ -399,7 +415,7 @@ module RightAws
       #
     def describe_instances(list=[])
       link = generate_request("DescribeInstances", hash_params('InstanceId',list.to_a))
-      request_cache_or_info(:describe_instances, link,  QEc2DescribeInstancesParser, list.blank?) do |parser|
+      request_cache_or_info(:describe_instances, link,  QEc2DescribeInstancesParser, @@bench, list.blank?) do |parser|
         get_desc_instances(parser.result)
       end
     rescue Exception
@@ -413,7 +429,7 @@ module RightAws
       #
     def confirm_product_instance(instance, product_code)
       link = generate_request("ConfirmProductInstance", { 'ProductCode' => product_code,
-                                                          'InstanceId'  => instance })
+                                'InstanceId'  => instance })
       request_info(link, QEc2ConfirmProductInstanceParser.new(:logger => @logger))
     end
     
@@ -519,7 +535,7 @@ module RightAws
           # Amazon 169.254.169.254 does not like escaped symbols!
           # And it doesn't like "\n" inside of encoded string! Grrr....
           # Otherwise, some of UserData symbols will be lost...
-        params['UserData'] = Base64.encode64(lparams[:user_data]).delete("\n") unless lparams[:user_data].blank?
+        params['UserData'] = Base64.encode64(lparams[:user_data]).delete("\n").strip unless lparams[:user_data].blank?
       end
       link = generate_request("RunInstances", params)
         #debugger
@@ -574,7 +590,127 @@ module RightAws
     rescue Exception
       on_exception
     end
+
+  #-----------------------------------------------------------------
+  #      Instances: Windows addons
+  #-----------------------------------------------------------------
+  
+      # Get initial Windows Server setup password from an instance console output.
+      #
+      #  my_awesome_key = ec2.create_key_pair('my_awesome_key') #=>
+      #    {:aws_key_name    => "my_awesome_key",
+      #     :aws_fingerprint => "01:02:03:f4:25:e6:97:e8:9b:02:1a:26:32:4e:58:6b:7a:8c:9f:03",
+      #     :aws_material    => "-----BEGIN RSA PRIVATE KEY-----\nMIIEpQIBAAK...Q8MDrCbuQ=\n-----END RSA PRIVATE KEY-----"}
+      #
+      #  my_awesome_instance = ec2.run_instances('ami-a000000a',1,1,['my_awesome_group'],'my_awesome_key', 'WindowsInstance!!!') #=>
+      #   [{:aws_image_id       => "ami-a000000a",
+      #     :aws_instance_id    => "i-12345678",
+      #     ...
+      #     :aws_availability_zone => "us-east-1b"
+      #     }]
+      #
+      #  # wait until instance enters 'operational' state and get it's initial password
+      #
+      #  puts ec2.get_initial_password(my_awesome_instance[:aws_instance_id], my_awesome_key[:aws_material]) #=> "MhjWcgZuY6"
+      #
+    def get_initial_password(instance_id, private_key)
+      console_output = get_console_output(instance_id)
+      crypted_password = console_output[:aws_output][%r{<Password>(.+)</Password>}m] && $1
+      unless crypted_password
+        raise AwsError.new("Initial password was not found in console output for #{instance_id}")
+      else
+        OpenSSL::PKey::RSA.new(private_key).private_decrypt(Base64.decode64(crypted_password))
+      end
+    rescue Exception
+      on_exception
+    end
+
+    # Bundle a Windows image.
+    # Internally, it queues the bundling task and shuts down the instance.
+    # It then takes a snapshot of the Windows volume bundles it, and uploads it to
+    # S3. After bundling completes, Rightaws::Ec2#register_image may be used to
+    # register the new Windows AMI for subsequent launches.
+    #
+    #   ec2.bundle_instance('i-e3e24e8a', 'my-awesome-bucket', 'my-win-image-1') #=>
+    #    [{:aws_update_time => "2008-10-16T13:58:25.000Z",
+    #      :s3_bucket       => "kd-win-1",
+    #      :s3_prefix       => "win2pr",
+    #      :aws_state       => "pending",
+    #      :aws_id          => "bun-26a7424f",
+    #      :aws_instance_id => "i-878a25ee",
+    #      :aws_start_time  => "2008-10-16T13:58:02.000Z"}]
+    #
+    def bundle_instance(instance_id, s3_bucket, s3_prefix, 
+                        s3_owner_aws_access_key_id=nil, s3_owner_aws_secret_access_key=nil,
+                        s3_expires = S3Interface::DEFAULT_EXPIRES_AFTER,
+                        s3_upload_policy='ec2-bundle-read')
+      # S3 access and signatures
+      s3_owner_aws_access_key_id     ||= @aws_access_key_id
+      s3_owner_aws_secret_access_key ||= @aws_secret_access_key
+      s3_expires = Time.now.utc + s3_expires if s3_expires.is_a?(Fixnum) && (s3_expires < S3Interface::ONE_YEAR_IN_SECONDS)
+      # policy
+      policy = { 'expiration' => s3_expires.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                 'conditions' => [ { 'bucket' => s3_bucket },
+                                   { 'acl'    => s3_upload_policy },
+                                   [ 'starts-with', '$key', s3_prefix ] ] }.to_json
+      policy64        = Base64.encode64(policy).gsub("\n","")
+      signed_policy64 = AwsUtils.sign(s3_owner_aws_secret_access_key, policy64)
+      # fill request params
+      params = { 'InstanceId'                       => instance_id,
+                 'Storage.S3.AWSAccessKeyId'        => s3_owner_aws_access_key_id,
+                 'Storage.S3.UploadPolicy'          => policy64,
+                 'Storage.S3.UploadPolicySignature' => signed_policy64,
+                 'Storage.S3.Bucket'                => s3_bucket,
+                 'Storage.S3.Prefix'                => s3_prefix,
+                 }
+      link = generate_request("BundleInstance", params)
+      request_info(link, QEc2BundleInstanceParser.new)
+    rescue Exception
+      on_exception
+    end
     
+      # Describe the status of the Windows AMI bundlings.
+      # If +list+ is omitted the returns the whole list of tasks.
+      #
+      #  ec2.describe_bundle_tasks(['bun-4fa74226']) #=>
+      #    [{:s3_bucket         => "my-awesome-bucket"
+      #      :aws_id            => "bun-0fa70206",
+      #      :s3_prefix         => "win1pr",
+      #      :aws_start_time    => "2008-10-14T16:27:57.000Z",
+      #      :aws_update_time   => "2008-10-14T16:37:10.000Z",
+      #      :aws_error_code    => "Client.S3Error",
+      #      :aws_error_message =>
+      #       "AccessDenied(403)- Invalid according to Policy: Policy Condition failed: [\"eq\", \"$acl\", \"aws-exec-read\"]",
+      #      :aws_state         => "failed",
+      #      :aws_instance_id   => "i-e3e24e8a"}]
+      #
+    def describe_bundle_tasks(list=[])
+      link = generate_request("DescribeBundleTasks", hash_params('BundleId', list.to_a))
+      request_info(link, QEc2DescribeBundleTasksParser.new)
+    rescue Exception
+      on_exception
+    end
+
+      # Cancel an in‐progress or pending bundle task by id.
+      #
+      #  ec2.cancel_bundle_task('bun-73a7421a') #=>
+      #   [{:s3_bucket         => "my-awesome-bucket"
+      #     :aws_id            => "bun-0fa70206",
+      #     :s3_prefix         => "win02",
+      #     :aws_start_time    => "2008-10-14T13:00:29.000Z",
+      #     :aws_error_message => "User has requested bundling operation cancellation",
+      #     :aws_state         => "failed",
+      #     :aws_update_time   => "2008-10-14T13:01:31.000Z",
+      #     :aws_error_code    => "Client.Cancelled",
+      #     :aws_instance_id   => "i-e3e24e8a"}
+      #
+    def cancel_bundle_task(bundle_id)
+      link = generate_request("CancelBundleTask", { 'BundleId' => bundle_id })
+      request_info(link, QEc2BundleInstanceParser.new)
+    rescue Exception
+      on_exception
+    end
+
   #-----------------------------------------------------------------
   #      Security groups
   #-----------------------------------------------------------------
@@ -596,7 +732,7 @@ module RightAws
       #
     def describe_security_groups(list=[])
       link = generate_request("DescribeSecurityGroups", hash_params('GroupName',list.to_a))
-      request_cache_or_info( :describe_security_groups, link,  QEc2DescribeSecurityGroupsParser, list.blank?) do |parser|
+      request_cache_or_info( :describe_security_groups, link,  QEc2DescribeSecurityGroupsParser, @@bench, list.blank?) do |parser|
         result = []     
         parser.result.each do |item|
           perms = []
@@ -641,7 +777,7 @@ module RightAws
       # EC2 doesn't like an empty description...
       description = " " if description.blank?
       link = generate_request("CreateSecurityGroup", 
-                              'GroupName'        => name.to_s, 
+                              'GroupName'        => name.to_s,
                               'GroupDescription' => description.to_s)
       request_info(link, RightBoolResponseParser.new(:logger => @logger))
     rescue Exception
@@ -667,8 +803,8 @@ module RightAws
       #
     def authorize_security_group_named_ingress(name, owner, group)
       link = generate_request("AuthorizeSecurityGroupIngress", 
-                              'GroupName'                  => name.to_s, 
-                              'SourceSecurityGroupName'    => group.to_s, 
+                              'GroupName'                  => name.to_s,
+                                'SourceSecurityGroupName'    => group.to_s,
                               'SourceSecurityGroupOwnerId' => owner.to_s.gsub(/-/,''))
       request_info(link, RightBoolResponseParser.new(:logger => @logger))
     rescue Exception
@@ -681,8 +817,8 @@ module RightAws
       #
     def revoke_security_group_named_ingress(name, owner, group)
       link = generate_request("RevokeSecurityGroupIngress", 
-                              'GroupName'                  => name.to_s, 
-                              'SourceSecurityGroupName'    => group.to_s, 
+                              'GroupName'                  => name.to_s,
+                              'SourceSecurityGroupName'    => group.to_s,
                               'SourceSecurityGroupOwnerId' => owner.to_s.gsub(/-/,''))
       request_info(link, RightBoolResponseParser.new(:logger => @logger))
     rescue Exception
@@ -696,10 +832,10 @@ module RightAws
       #
     def authorize_security_group_IP_ingress(name, from_port, to_port, protocol='tcp', cidr_ip='0.0.0.0/0')
       link = generate_request("AuthorizeSecurityGroupIngress", 
-                              'GroupName'  => name.to_s, 
-                              'IpProtocol' => protocol.to_s, 
-                              'FromPort'   => from_port.to_s, 
-                              'ToPort'     => to_port.to_s, 
+                              'GroupName'  => name.to_s,
+                              'IpProtocol' => protocol.to_s,
+                              'FromPort'   => from_port.to_s,
+                              'ToPort'     => to_port.to_s,
                               'CidrIp'     => cidr_ip.to_s)
       request_info(link, RightBoolResponseParser.new(:logger => @logger))
     rescue Exception
@@ -712,10 +848,10 @@ module RightAws
       #
     def revoke_security_group_IP_ingress(name, from_port, to_port, protocol='tcp', cidr_ip='0.0.0.0/0')
       link = generate_request("RevokeSecurityGroupIngress", 
-                              'GroupName'  => name.to_s, 
-                              'IpProtocol' => protocol.to_s, 
-                              'FromPort'   => from_port.to_s, 
-                              'ToPort'     => to_port.to_s, 
+                              'GroupName'  => name.to_s,
+                              'IpProtocol' => protocol.to_s,
+                              'FromPort'   => from_port.to_s,
+                              'ToPort'     => to_port.to_s,
                               'CidrIp'     => cidr_ip.to_s)
       request_info(link, RightBoolResponseParser.new(:logger => @logger))
     rescue Exception
@@ -736,7 +872,7 @@ module RightAws
       #
     def describe_key_pairs(list=[])
       link = generate_request("DescribeKeyPairs", hash_params('KeyName',list.to_a))
-      request_cache_or_info :describe_key_pairs, link,  QEc2DescribeKeyPairParser, list.blank?
+      request_cache_or_info :describe_key_pairs, link,  QEc2DescribeKeyPairParser, @@bench, list.blank?
     rescue Exception
       on_exception
     end
@@ -755,7 +891,7 @@ module RightAws
     rescue Exception
       on_exception
     end
-      
+
       # Delete a key pair. Returns +true+ or an exception.
       #
       #  ec2.delete_key_pair('my_awesome_key') #=> true
@@ -809,7 +945,7 @@ module RightAws
     def describe_addresses(list=[])
       link = generate_request("DescribeAddresses", 
                               hash_params('PublicIp',list.to_a))
-      request_cache_or_info :describe_addresses, link,  QEc2DescribeAddressesParser, list.blank?
+      request_cache_or_info :describe_addresses, link,  QEc2DescribeAddressesParser, @@bench, list.blank?
     rescue Exception
       on_exception
     end
@@ -847,21 +983,242 @@ module RightAws
     # Describes availability zones that are currently available to the account and their states.
     # Returns an array of 2 keys (:zone_name and :zone_state) hashes:
     #
-    #  ec2.describe_availability_zones  #=> [{:zone_state=>"available", :zone_name=>"us-east-1a"}, 
-    #                                        {:zone_state=>"available", :zone_name=>"us-east-1b"}, 
-    #                                        {:zone_state=>"available", :zone_name=>"us-east-1c"}]
+    #  ec2.describe_availability_zones  #=> [{:region_name=>"us-east-1",
+    #                                         :zone_name=>"us-east-1a",
+    #                                         :zone_state=>"available"}, ... ]
     #
-    #  ec2.describe_availability_zones('us-east-1c') #=> [{:zone_state=>"available", :zone_name=>"us-east-1c"}]
+    #  ec2.describe_availability_zones('us-east-1c') #=> [{:region_name=>"us-east-1", 
+    #                                                      :zone_state=>"available",
+    #                                                      :zone_name=>"us-east-1c"}]
     #
     def describe_availability_zones(list=[])
       link = generate_request("DescribeAvailabilityZones", 
                               hash_params('ZoneName',list.to_a))
-      request_cache_or_info :describe_availability_zones, link,  QEc2DescribeAvailabilityZonesParser, list.blank?
+      request_cache_or_info :describe_availability_zones, link,  QEc2DescribeAvailabilityZonesParser, @@bench, list.blank?
     rescue Exception
       on_exception
     end
 
+  #-----------------------------------------------------------------
+  #      Regions
+  #-----------------------------------------------------------------
+
+    # Describe regions.
+    #
+    #  ec2.describe_regions  #=> ["eu-west-1", "us-east-1"]
+    #
+    def describe_regions(list=[])
+      link = generate_request("DescribeRegions",
+                              hash_params('RegionName',list.to_a))
+      request_cache_or_info :describe_regions, link,  QEc2DescribeRegionsParser, @@bench, list.blank?
+    rescue Exception
+      on_exception
+    end
+
+
+  #-----------------------------------------------------------------
+  #      EBS: Volumes
+  #-----------------------------------------------------------------
   
+    # Describe all EBS volumes.
+    #
+    #  ec2.describe_volumes #=> 
+    #      [{:aws_size              => 94,
+    #        :aws_device            => "/dev/sdc",
+    #        :aws_attachment_status => "attached",
+    #        :zone                  => "merlot",
+    #        :snapshot_id           => nil,
+    #        :aws_attached_at       => Wed Jun 18 08:19:28 UTC 2008,
+    #        :aws_status            => "in-use",
+    #        :aws_id                => "vol-60957009",
+    #        :aws_created_at        => Wed Jun 18 08:19:20s UTC 2008,
+    #        :aws_instance_id       => "i-c014c0a9"},
+    #       {:aws_size       => 1,
+    #        :zone           => "merlot",
+    #        :snapshot_id    => nil,
+    #        :aws_status     => "available",
+    #        :aws_id         => "vol-58957031",
+    #        :aws_created_at => Wed Jun 18 08:19:21 UTC 2008,}, ... ]
+    #
+    def describe_volumes(list=[])
+      link = generate_request("DescribeVolumes", 
+                              hash_params('VolumeId',list.to_a))
+      request_cache_or_info :describe_volumes, link,  QEc2DescribeVolumesParser, @@bench, list.blank?
+    rescue Exception
+      on_exception
+    end
+    
+    # Create new EBS volume based on previously created snapshot. 
+    # +Size+ in Gigabytes.
+    #
+    #  ec2.create_volume('snap-000000', 10, zone) #=> 
+    #      {:snapshot_id    => "snap-e21df98b",
+    #       :aws_status     => "creating",
+    #       :aws_id         => "vol-fc9f7a95",
+    #       :zone           => "merlot",
+    #       :aws_created_at => Tue Jun 24 18:13:32 UTC 2008,
+    #       :aws_size       => 94}
+    #
+    def create_volume(zone, snapshot_id, size)
+      hash = {"AvailabilityZone" => zone.to_s}
+      hash["SnapshotId"] = snapshot_id.to_s unless snapshot_id.blank?
+      hash["Size"] = size.to_s              unless size.blank?
+
+      link = generate_request("CreateVolume", hash)
+
+      request_info(link, QEc2CreateVolumeParser.new(:logger => @logger))
+    rescue Exception
+      on_exception
+    end
+
+    # Delete the specified EBS volume. 
+    # This does not deletes any snapshots created from this volume.
+    #
+    #  ec2.delete_volume('vol-b48a6fdd') #=> true
+    #
+    def delete_volume(volume_id)
+      link = generate_request("DeleteVolume", 
+                              "VolumeId" => volume_id.to_s)
+      request_info(link, RightBoolResponseParser.new(:logger => @logger))
+    rescue Exception
+      on_exception
+    end
+    
+    # Attach the specified EBS volume to a specified instance, exposing the
+    # volume using the specified device name.
+    #
+    #  ec2.attach_volume('vol-898a6fe0', 'i-7c905415', '/dev/sdh') #=>
+    #    { :aws_instance_id => "i-7c905415",
+    #      :aws_device      => "/dev/sdh",
+    #      :aws_status      => "attaching",
+    #      :aws_attached_at => "2008-03-28T14:14:39.000Z",
+    #      :aws_id          => "vol-898a6fe0" }
+    #
+    def attach_volume(volume_id, instance_id, device)
+      link = generate_request("AttachVolume", 
+                              "VolumeId"   => volume_id.to_s,
+                              "InstanceId" => instance_id.to_s,
+                              "Device"     => device.to_s)
+      request_info(link, QEc2AttachAndDetachVolumeParser.new(:logger => @logger))
+    rescue Exception
+      on_exception
+    end
+    
+    # Detach the specified EBS volume from the instance to which it is attached.
+    # 
+    #   ec2.detach_volume('vol-898a6fe0') #=> 
+    #     { :aws_instance_id => "i-7c905415",
+    #       :aws_device      => "/dev/sdh",
+    #       :aws_status      => "detaching",
+    #       :aws_attached_at => "2008-03-28T14:38:34.000Z",
+    #       :aws_id          => "vol-898a6fe0"}
+    #
+    def detach_volume(volume_id, instance_id=nil, device=nil, force=nil)
+      hash = { "VolumeId" => volume_id.to_s }
+      hash["InstanceId"] = instance_id.to_s unless instance_id.blank?
+      hash["Device"]     = device.to_s      unless device.blank?
+      hash["Force"]      = 'true'           if     force
+      #
+      link = generate_request("DetachVolume", hash)
+      request_info(link, QEc2AttachAndDetachVolumeParser.new(:logger => @logger))
+    rescue Exception
+      on_exception
+    end
+
+    
+  #-----------------------------------------------------------------
+  #      EBS: Snapshots
+  #-----------------------------------------------------------------
+
+     # Describe all EBS snapshots.
+     #
+     # ec2.describe_snapshots #=> 
+     #   [ { :aws_progress   => "100%",
+     #       :aws_status     => "completed",
+     #       :aws_id         => "snap-72a5401b",
+     #       :aws_volume_id  => "vol-5582673c",
+     #       :aws_started_at => "2008-02-23T02:50:48.000Z"},
+     #     { :aws_progress   => "100%",
+     #       :aws_status     => "completed",
+     #       :aws_id         => "snap-75a5401c",
+     #       :aws_volume_id  => "vol-5582673c",
+     #       :aws_started_at => "2008-02-23T16:23:19.000Z" },...]
+     #
+    def describe_snapshots(list=[])
+      link = generate_request("DescribeSnapshots", 
+                              hash_params('SnapshotId',list.to_a))
+      request_cache_or_info :describe_snapshots, link,  QEc2DescribeSnapshotsParser, @@bench, list.blank?
+    rescue Exception
+      on_exception
+    end
+
+    # Create a snapshot of specified volume.
+    #
+    #  ec2.create_snapshot('vol-898a6fe0') #=> 
+    #      {:aws_volume_id  => "vol-fd9f7a94",
+    #       :aws_started_at => Tue Jun 24 18:40:40 UTC 2008,
+    #       :aws_progress   => "",
+    #       :aws_status     => "pending",
+    #       :aws_id         => "snap-d56783bc"}
+    #
+    def create_snapshot(volume_id)
+      link = generate_request("CreateSnapshot", 
+                              "VolumeId" => volume_id.to_s)
+      request_info(link, QEc2CreateSnapshotParser.new(:logger => @logger))
+    rescue Exception
+      on_exception
+    end
+    
+    # Create a snapshot of specified volume, but with the normal retry algorithms disabled.
+    # This method will return immediately upon error.  The user can specify connect and read timeouts (in s)
+    # for the connection to AWS.  If the user does not specify timeouts, try_create_snapshot uses the default values
+    # in Rightscale::HttpConnection.
+    #
+    #  ec2.try_create_snapshot('vol-898a6fe0') #=> 
+    #      {:aws_volume_id  => "vol-fd9f7a94",
+    #       :aws_started_at => Tue Jun 24 18:40:40 UTC 2008,
+    #       :aws_progress   => "",
+    #       :aws_status     => "pending",
+    #       :aws_id         => "snap-d56783bc"}
+    #
+    def try_create_snapshot(volume_id, connect_timeout = nil, read_timeout = nil)
+      # For safety in the ensure block...we don't want to restore values 
+      # if we never read them in the first place
+      orig_reiteration_time = nil
+      orig_http_params = nil
+      
+      orig_reiteration_time = RightAws::AWSErrorHandler::reiteration_time
+      RightAws::AWSErrorHandler::reiteration_time = 0
+      
+      orig_http_params = Rightscale::HttpConnection::params()
+      new_http_params = orig_http_params.dup
+      new_http_params[:http_connection_retry_count] = 0
+      new_http_params[:http_connection_open_timeout] = connect_timeout if !connect_timeout.nil?
+      new_http_params[:http_connection_read_timeout] = read_timeout if !read_timeout.nil?
+      Rightscale::HttpConnection::params = new_http_params
+      
+      link = generate_request("CreateSnapshot", 
+                              "VolumeId" => volume_id.to_s)
+      request_info(link, QEc2CreateSnapshotParser.new(:logger => @logger))
+     
+    rescue Exception
+      on_exception
+    ensure
+      RightAws::AWSErrorHandler::reiteration_time = orig_reiteration_time if orig_reiteration_time
+      Rightscale::HttpConnection::params = orig_http_params if orig_http_params
+    end
+
+    # Delete the specified snapshot.
+    #
+    #  ec2.delete_snapshot('snap-55a5403c') #=> true
+    #
+    def delete_snapshot(snapshot_id)
+      link = generate_request("DeleteSnapshot", 
+                              "SnapshotId" => snapshot_id.to_s)
+      request_info(link, RightBoolResponseParser.new(:logger => @logger))
+    rescue Exception
+      on_exception
+    end
     
   #-----------------------------------------------------------------
   #      PARSERS: Boolean Response Parser
@@ -1000,6 +1357,7 @@ module RightAws
           when 'kernelId'      then @image[:aws_kernel_id]  = @text
           when 'ramdiskId'     then @image[:aws_ramdisk_id] = @text
           when 'item'          then @result << @image if @xmlpath[%r{.*/imagesSet$}]
+          when 'platform'      then @image[:platform] = @text
         end
       end
       def reset
@@ -1095,6 +1453,7 @@ module RightAws
           when 'launchTime'       then @instance[:aws_launch_time]    = @text
           when 'kernelId'         then @instance[:aws_kernel_id]      = @text
           when 'ramdiskId'        then @instance[:aws_ramdisk_id]     = @text
+          when 'platform'         then @instance[:aws_platform]       = @text
           when 'availabilityZone' then @instance[:aws_availability_zone] = @text
           when 'item'
             if @xmlpath == 'DescribeInstancesResponse/reservationSet/item/instancesSet' || # DescribeInstances property
@@ -1159,18 +1518,54 @@ module RightAws
     end
 
   #-----------------------------------------------------------------
-  #      PARSERS: Fake
+  #      Instances: Wondows related part
   #-----------------------------------------------------------------
-  
-    # Dummy parser - does nothing
-    # Returns the original params back
-    class QEc2DummyParser  # :nodoc:
-      attr_accessor :result
-      def parse(response, params={})
-        @result = [response, params]
+    class QEc2DescribeBundleTasksParser < RightAWSParser #:nodoc:
+      def tagstart(name, attributes)
+        @bundle = {} if name == 'item'
+      end
+      def tagend(name)
+        case name
+#        when 'requestId'  then @bundle[:request_id]    = @text
+        when 'instanceId' then @bundle[:aws_instance_id]   = @text
+        when 'bundleId'   then @bundle[:aws_id]            = @text
+        when 'bucket'     then @bundle[:s3_bucket]         = @text
+        when 'prefix'     then @bundle[:s3_prefix]         = @text
+        when 'startTime'  then @bundle[:aws_start_time]    = @text
+        when 'updateTime' then @bundle[:aws_update_time]   = @text
+        when 'state'      then @bundle[:aws_state]         = @text
+        when 'progress'   then @bundle[:aws_progress]      = @text
+        when 'code'       then @bundle[:aws_error_code]    = @text
+        when 'message'    then @bundle[:aws_error_message] = @text
+        when 'item'       then @result                    << @bundle
+        end
+      end
+      def reset
+        @result = []
       end
     end
-    
+
+    class QEc2BundleInstanceParser < RightAWSParser #:nodoc:
+      def tagend(name)
+        case name
+#        when 'requestId'  then @result[:request_id]    = @text
+        when 'instanceId' then @result[:aws_instance_id]   = @text
+        when 'bundleId'   then @result[:aws_id]            = @text
+        when 'bucket'     then @result[:s3_bucket]         = @text
+        when 'prefix'     then @result[:s3_prefix]         = @text
+        when 'startTime'  then @result[:aws_start_time]    = @text
+        when 'updateTime' then @result[:aws_update_time]   = @text
+        when 'state'      then @result[:aws_state]         = @text
+        when 'progress'   then @result[:aws_progress]      = @text
+        when 'code'       then @result[:aws_error_code]    = @text
+        when 'message'    then @result[:aws_error_message] = @text
+        end
+      end
+      def reset
+        @result = {}
+      end
+    end
+
   #-----------------------------------------------------------------
   #      PARSERS: Elastic IPs
   #-----------------------------------------------------------------
@@ -1207,8 +1602,9 @@ module RightAws
       end
       def tagend(name)
         case name
-        when 'zoneName'  then @zone[:zone_name]  = @text
-        when 'zoneState' then @zone[:zone_state] = @text
+        when 'regionName' then @zone[:region_name] = @text
+        when 'zoneName'   then @zone[:zone_name]   = @text
+        when 'zoneState'  then @zone[:zone_state]  = @text
         when 'item'      then @result << @zone
         end
       end
@@ -1217,7 +1613,129 @@ module RightAws
       end
     end
 
+  #-----------------------------------------------------------------
+  #      PARSERS: Regions
+  #-----------------------------------------------------------------
+
+    class QEc2DescribeRegionsParser < RightAWSParser #:nodoc:
+      def tagend(name)
+        @result << @text if name == 'regionName'
+      end
+      def reset
+        @result = []
+      end
+    end
+
+  #-----------------------------------------------------------------
+  #      PARSERS: EBS - Volumes
+  #-----------------------------------------------------------------
  
+    class QEc2CreateVolumeParser < RightAWSParser #:nodoc:
+      def tagend(name)
+        case name 
+          when 'volumeId'         then @result[:aws_id]         = @text
+          when 'status'           then @result[:aws_status]     = @text
+          when 'createTime'       then @result[:aws_created_at] = Time.parse(@text)
+          when 'size'             then @result[:aws_size]       = @text.to_i ###
+          when 'snapshotId'       then @result[:snapshot_id]    = @text.blank? ? nil : @text ###
+          when 'availabilityZone' then @result[:zone]           = @text ###
+        end
+      end
+      def reset
+        @result = {}
+      end
+    end
+    
+    class QEc2AttachAndDetachVolumeParser < RightAWSParser #:nodoc:
+      def tagend(name)
+        case name 
+          when 'volumeId'   then @result[:aws_id]                = @text
+          when 'instanceId' then @result[:aws_instance_id]       = @text
+          when 'device'     then @result[:aws_device]            = @text
+          when 'status'     then @result[:aws_attachment_status] = @text
+          when 'attachTime' then @result[:aws_attached_at]       = Time.parse(@text)
+        end
+      end
+      def reset
+        @result = {}
+      end
+    end
+      
+    class QEc2DescribeVolumesParser < RightAWSParser #:nodoc:
+      def tagstart(name, attributes)
+        case name
+        when 'item'
+          case @xmlpath
+            when 'DescribeVolumesResponse/volumeSet' then @volume = {}
+          end
+        end
+      end
+      def tagend(name)
+        case name 
+          when 'volumeId'
+            case @xmlpath
+            when 'DescribeVolumesResponse/volumeSet/item' then @volume[:aws_id] = @text
+            end
+          when 'status'
+            case @xmlpath
+            when 'DescribeVolumesResponse/volumeSet/item' then @volume[:aws_status] = @text
+            when 'DescribeVolumesResponse/volumeSet/item/attachmentSet/item' then @volume[:aws_attachment_status] = @text
+            end
+          when 'size'             then @volume[:aws_size]        = @text.to_i
+          when 'createTime'       then @volume[:aws_created_at]  = Time.parse(@text)
+          when 'instanceId'       then @volume[:aws_instance_id] = @text
+          when 'device'           then @volume[:aws_device]      = @text
+          when 'attachTime'       then @volume[:aws_attached_at] = Time.parse(@text)
+          when 'snapshotId'       then @volume[:snapshot_id]     = @text.blank? ? nil : @text
+          when 'availabilityZone' then @volume[:zone]            = @text
+          when 'item' 
+            case @xmlpath
+            when 'DescribeVolumesResponse/volumeSet' then @result << @volume
+            end
+        end
+      end
+      def reset
+        @result = []
+      end
+    end
+
+  #-----------------------------------------------------------------
+  #      PARSERS: EBS - Snapshots
+  #-----------------------------------------------------------------
+  
+    class QEc2DescribeSnapshotsParser < RightAWSParser #:nodoc:
+      def tagstart(name, attributes)
+        @snapshot = {} if name == 'item'
+      end
+      def tagend(name)
+        case name 
+          when 'volumeId'   then @snapshot[:aws_volume_id]  = @text
+          when 'snapshotId' then @snapshot[:aws_id]         = @text
+          when 'status'     then @snapshot[:aws_status]     = @text
+          when 'startTime'  then @snapshot[:aws_started_at] = Time.parse(@text)
+          when 'progress'   then @snapshot[:aws_progress]   = @text
+          when 'item'       then @result                   << @snapshot
+        end
+      end
+      def reset
+        @result = []
+      end
+    end
+
+    class QEc2CreateSnapshotParser < RightAWSParser #:nodoc:
+      def tagend(name)
+        case name 
+          when 'volumeId'   then @result[:aws_volume_id]  = @text
+          when 'snapshotId' then @result[:aws_id]         = @text
+          when 'status'     then @result[:aws_status]     = @text
+          when 'startTime'  then @result[:aws_started_at] = Time.parse(@text)
+          when 'progress'   then @result[:aws_progress]   = @text
+        end
+      end
+      def reset
+        @result = {}
+      end
+    end
     
   end
       

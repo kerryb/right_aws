@@ -24,7 +24,7 @@
 begin
   require 'uuidtools'
 rescue LoadError => e
-  STDERR.puts("RightSDB Alpha requires the uuidtools gem.  Run \'gem install uuidtools\' and try again.")
+  STDERR.puts("RightSDB requires the uuidtools gem.  Run \'gem install uuidtools\' and try again.")
   exit
 end
 
@@ -101,6 +101,15 @@ module RightAws
       # Create a new handle to an Sdb account. All handles share the same per process or per thread
       # HTTP connection to Amazon Sdb. Each handle is for a specific account.
       # The +params+ are passed through as-is to RightAws::SdbInterface.new
+      # Params:
+      #    { :server       => 'sdb.amazonaws.com'  # Amazon service host: 'sdb.amazonaws.com'(default)
+      #      :port         => 443                  # Amazon service port: 80 or 443(default)
+      #      :protocol     => 'https'              # Amazon service protocol: 'http' or 'https'(default)
+      #      :signature_version => '0'             # The signature version : '0' or '1'(default)
+      #      :multi_thread => true|false           # Multi-threaded (connection per each thread): true or false(default)
+      #      :logger       => Logger Object        # Logger instance: logs to STDOUT if omitted 
+      #      :nil_representation => 'mynil'}       # interpret Ruby nil as this string value; i.e. use this string in SDB to represent Ruby nils (default is the string 'nil')
+
       def establish_connection(aws_access_key_id=nil, aws_secret_access_key=nil, params={})
         @connection = RightAws::SdbInterface.new(aws_access_key_id, aws_secret_access_key, params)
       end
@@ -259,9 +268,10 @@ module RightAws
         #  Client.find_by_name('Matias Rust')
         #  Client.find_by_name_and_city('Putin','Moscow')
         #  Client.find_by_name_and_city_and_post('Medvedev','Moscow','president')
-        #  
+        #
         #  Client.find_all_by_author('G.Bush jr')
         #  Client.find_all_by_age_and_gender_and_ethnicity('34','male','russian')
+        #  Client.find_all_by_gender_and_country('male', 'Russia', :auto_load => true, :order => 'name desc')
         #
         # Returned records have to be +reloaded+ to access their attributes.
         # 
@@ -276,57 +286,110 @@ module RightAws
         #    Client.find(:all, :limit => 10, :next_token => Client.next_token)
         #  end while Client.next_token
         #
+        #  Sort oder:
+        #    Client.find(:all, :order => 'gender')
+        #    Client.find(:all, :order => 'name desc')
+        #
+        #  Attributes auto load (be carefull - this may take lot of time for a huge bunch of records):
+        #    Client.find(:first)                      #=> #<Client:0xb77d0d40 @attributes={"id"=>"2937601a-e45d-11dc-a75f-001bfc466dd7"}, @new_record=false>
+        #    Client.find(:first, :auto_load => true)  #=> #<Client:0xb77d0d40 @attributes={"id"=>"2937601a-e45d-11dc-a75f-001bfc466dd7", "name"=>["Cat"], "toys"=>["Jons socks", "clew", "mice"]}, @new_record=false>
+        #
+        # see http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?UsingQuery.html
+        #
         def find(*args)
           options = args.last.is_a?(Hash) ? args.pop : {}
           case args.first
-            when :all   : find_every    options
-            when :first : find_initial  options
-            else          find_from_ids args, options
+            when :all   then find_every    options
+            when :first then find_initial  options
+            else             find_from_ids args, options
           end
         end
 
-        protected
-        
-        def query(query_expression=nil, max_number_of_items = nil, next_token = nil) # :nodoc:
-          @next_token = next_token
-          # request items
-          query_result = self.connection.query(domain, query_expression, max_number_of_items, @next_token)
-          @next_token = query_result[:next_token]
-          items = query_result[:items].map do |name| 
-            new_item = self.new('id' => name)
-            new_item.mark_as_old
-            new_item
+        # Perform a SQL-like select request.
+        #
+        # Single record:
+        #
+        #  Client.select(:first)
+        #  Client.select(:first, :conditions=> [ "name=? AND wife=?", "Jon", "Sandy"])
+        #  Client.select(:first, :conditions=> { :name=>"Jon", :wife=>"Sandy" }, :select => :girfriends)
+        #
+        # Bunch of records:
+        #
+        #  Client.select(:all)
+        #  Client.select(:all, :limit => 10)
+        #  Client.select(:all, :conditions=> [ "name=? AND 'girlfriend'=?", "Jon", "Judy"])
+        #  Client.select(:all, :conditions=> { :name=>"Sandy" }, :limit => 3)
+        #
+        # Records by ids:
+        #
+        #  Client.select('1')
+        #  Client.select('1234987b4583475347523948')
+        #  Client.select('1','2','3','4', :conditions=> ["toys=?", "beer"])
+        #
+        # Find helpers: RightAws::ActiveSdb::Base.select_by_... and RightAws::ActiveSdb::Base.select_all_by_...
+        #
+        #  Client.select_by_name('Matias Rust')
+        #  Client.select_by_name_and_city('Putin','Moscow')
+        #  Client.select_by_name_and_city_and_post('Medvedev','Moscow','president')
+        #
+        #  Client.select_all_by_author('G.Bush jr')
+        #  Client.select_all_by_age_and_gender_and_ethnicity('34','male','russian')
+        #  Client.select_all_by_gender_and_country('male', 'Russia', :order => 'name')
+        #
+        # Continue listing:
+        #
+        #  # initial listing
+        #  Client.select(:all, :limit => 10)
+        #  # continue listing
+        #  begin
+        #    Client.select(:all, :limit => 10, :next_token => Client.next_token)
+        #  end while Client.next_token
+        #
+        #  Sort oder:
+        #  If :order=>'attribute' option is specified then result response (ordered by 'attribute') will contain only items where attribute is defined (is not null).
+        #  
+        #    Client.select(:all)                         # returns all records
+        #    Client.select(:all, :order => 'gender')     # returns all records ordered by gender where gender attribute exists
+        #    Client.select(:all, :order => 'name desc')  # returns all records ordered by name in desc order where name attribute exists
+        #
+        # see http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?UsingSelect.html
+        #
+        def select(*args)
+          options = args.last.is_a?(Hash) ? args.pop : {}
+          case args.first
+            when :all   then sql_select(options)
+            when :first then sql_select(options.merge(:limit => 1)).first
+            else             select_from_ids args, options
           end
-          items
         end
 
-        def find_every(options) # :nodoc:
-          query(options[:conditions], options[:limit], options[:next_token])
+        def generate_id # :nodoc:
+          UUID.timestamp_create().to_s
         end
 
-        def find_initial(options) # :nodoc:
-          options[:limit] = 1
-          find_every(options)[0]
-        end
+      protected
 
-        def find_from_ids(args, options) # :nodoc:
+        # Select
+
+        def select_from_ids(args, options) # :nodoc:
           cond = []
           # detect amount of records requested
           bunch_of_records_requested = args.size > 1 || args.first.is_a?(Array)
           # flatten ids
           args = args.to_a.flatten
-          args.each { |id| cond << "'id'=#{self.connection.escape(id)}" }
-          ids_cond = "[#{cond.join(' OR ')}]"
+          args.each { |id| cond << "id=#{self.connection.escape(id)}" }
+          ids_cond = "(#{cond.join(' OR ')})"
           # user defined :conditions to string (if it was defined)
-          if options[:conditions].is_a?(Array)
-            options[:conditions] = connection.query_expression_from_array(options[:conditions])
-          end
+          options[:conditions] = build_conditions(options[:conditions])
           # join ids condition and user defined conditions
-          options[:conditions] = options[:conditions].blank? ? ids_cond : "#{options[:conditions]} intersection #{ids_cond}"
-          result = find_every(options)
+          options[:conditions] = options[:conditions].blank? ? ids_cond : "(#{options[:conditions]}) AND #{ids_cond}"
+          result = sql_select(options)
           # if one record was requested then return it
           unless bunch_of_records_requested
-            result.first
+            record = result.first
+            # railse if nothing was found
+            raise ActiveSdbError.new("Couldn't find #{name} with ID #{args}") unless record
+            record
           else
             # if a bunch of records was requested then return check that we found all of them
             # and return as an array
@@ -339,30 +402,194 @@ module RightAws
           end
         end
 
-        # find_by helpers 
-        def find_all_by_(format_str, args, limit=nil) # :nodoc:
-          fields = format_str.to_s.sub(/^find_(all_)?by_/,'').split('_and_')
-          conditions = fields.map { |field| "['#{field}'=?]" }.join(' intersection ')
-          find(:all, :conditions => [conditions, *args], :limit => limit)
+        def sql_select(options) # :nodoc:
+          @next_token = options[:next_token]
+          select_expression = build_select(options)
+          # request items
+          query_result = self.connection.select(select_expression, @next_token)
+          @next_token = query_result[:next_token]
+          items = query_result[:items].map do |hash|
+            id, attributes = hash.shift
+            new_item = self.new( attributes.merge({ 'id' => id }))
+            new_item.mark_as_old
+            new_item
+          end
+          items
         end
 
-        def find_by_(format_str, args) # :nodoc:
-          find_all_by_(format_str, args, 1)[0]
+        # select_by helpers
+        def select_all_by_(format_str, args, options) # :nodoc:
+          fields = format_str.to_s.sub(/^select_(all_)?by_/,'').split('_and_')
+          conditions = fields.map { |field| "#{field}=?" }.join(' AND ')
+          options[:conditions] = [conditions, *args]
+          select(:all, options)
         end
 
-        def method_missing(method, *args) # :nodoc:
-          if    method.to_s[/^find_all_by_/] then  return find_all_by_(method, args)
-          elsif method.to_s[/^find_by_/]     then  return find_by_(method, args)
-          else  super(method, *args)
+        def select_by_(format_str, args, options) # :nodoc:
+          options[:limit] = 1
+          select_all_by_(format_str, args, options).first
+        end
+
+        # Query
+
+        # Returns an array of query attributes.
+        # Query_expression must be a well formated SDB query string:
+        # query_attributes("['title' starts-with 'O\\'Reily'] intersection ['year' = '2007']") #=> ["title", "year"]
+        def query_attributes(query_expression) # :nodoc:
+          attrs = []
+          array = query_expression.scan(/['"](.*?[^\\])['"]/).flatten
+          until array.empty? do
+            attrs << array.shift # skip it's value
+            array.shift #
+          end
+          attrs
+        end
+
+        # Returns an array of [attribute_name, 'asc'|'desc']
+        def sort_options(sort_string)
+          sort_string[/['"]?(\w+)['"]? *(asc|desc)?/i]
+          [$1, ($2 || 'asc')]
+        end
+
+        # Perform a query request.
+        #
+        # Options
+        #  :query_expression     nil | string | array
+        #  :max_number_of_items  nil | integer
+        #  :next_token           nil | string
+        #  :sort_option          nil | string    "name desc|asc"
+        #
+        def query(options) # :nodoc:
+          @next_token = options[:next_token]
+          query_expression = build_conditions(options[:query_expression])
+          # add sort_options to the query_expression
+          if options[:sort_option]
+            sort_by, sort_order = sort_options(options[:sort_option])
+            sort_query_expression = "['#{sort_by}' starts-with '']"
+            sort_by_expression    = " sort '#{sort_by}' #{sort_order}"
+            # make query_expression to be a string (it may be null)
+            query_expression = query_expression.to_s
+            # quote from Amazon:
+            # The sort attribute must be present in at least one of the predicates of the query expression.
+            if query_expression.blank?
+              query_expression = sort_query_expression
+            elsif !query_attributes(query_expression).include?(sort_by)
+              query_expression += " intersection #{sort_query_expression}"
+            end
+            query_expression += sort_by_expression
+          end
+          # request items
+          query_result = self.connection.query(domain, query_expression, options[:max_number_of_items], @next_token)
+          @next_token = query_result[:next_token]
+          items = query_result[:items].map do |name| 
+            new_item = self.new('id' => name)
+            new_item.mark_as_old
+            reload_if_exists(record) if options[:auto_load]
+            new_item
+          end
+          items
+        end
+
+        # reload a record unless it is nil
+        def reload_if_exists(record) # :nodoc:
+          record && record.reload
+        end
+
+        def reload_all_records(*list) # :nodoc:
+          list.flatten.each { |record| reload_if_exists(record) }
+        end
+
+        def find_every(options) # :nodoc:
+          records = query( :query_expression    => options[:conditions],
+                           :max_number_of_items => options[:limit],
+                           :next_token          => options[:next_token],
+                           :sort_option         => options[:sort] || options[:order] )
+          options[:auto_load] ? reload_all_records(records) : records
+        end
+
+        def find_initial(options) # :nodoc:
+          options[:limit] = 1
+          record = find_every(options).first
+          options[:auto_load] ? reload_all_records(record).first : record
+        end
+
+        def find_from_ids(args, options) # :nodoc:
+          cond = []
+          # detect amount of records requested
+          bunch_of_records_requested = args.size > 1 || args.first.is_a?(Array)
+          # flatten ids
+          args = args.to_a.flatten
+          args.each { |id| cond << "'id'=#{self.connection.escape(id)}" }
+          ids_cond = "[#{cond.join(' OR ')}]"
+          # user defined :conditions to string (if it was defined)
+          options[:conditions] = build_conditions(options[:conditions])
+          # join ids condition and user defined conditions
+          options[:conditions] = options[:conditions].blank? ? ids_cond : "#{options[:conditions]} intersection #{ids_cond}"
+          result = find_every(options)
+          # if one record was requested then return it
+          unless bunch_of_records_requested
+            record = result.first
+            # railse if nothing was found
+            raise ActiveSdbError.new("Couldn't find #{name} with ID #{args}") unless record
+            options[:auto_load] ? reload_all_records(record).first : record
+          else
+            # if a bunch of records was requested then return check that we found all of them
+            # and return as an array
+            unless args.size == result.size
+              id_list = args.map{|i| "'#{i}'"}.join(',')
+              raise ActiveSdbError.new("Couldn't find all #{name} with IDs (#{id_list}) (found #{result.size} results, but was looking for #{args.size})")
+            else
+              options[:auto_load] ? reload_all_records(result) : result
+            end
           end
         end
-        
-      end
-      
-      def self.generate_id # :nodoc:
-        result = ''
-        result = UUID.timestamp_create().to_s
-        result
+
+        # find_by helpers 
+        def find_all_by_(format_str, args, options) # :nodoc:
+          fields = format_str.to_s.sub(/^find_(all_)?by_/,'').split('_and_')
+          conditions = fields.map { |field| "['#{field}'=?]" }.join(' intersection ')
+          options[:conditions] = [conditions, *args]
+          find(:all, options)
+        end
+
+        def find_by_(format_str, args, options) # :nodoc:
+          options[:limit] = 1
+          find_all_by_(format_str, args, options).first
+        end
+
+        # Misc
+
+        def method_missing(method, *args) # :nodoc:
+          if method.to_s[/^(find_all_by_|find_by_|select_all_by_|select_by_)/]
+            options = args.last.is_a?(Hash) ? args.pop : {}
+            __send__($1, method, args, options)
+          else
+            super(method, *args)
+          end
+        end
+
+        def build_select(options) # :nodoc:
+          select     = options[:select]    || '*'
+          from       = options[:from]      || domain
+          conditions = options[:conditions] ? " WHERE #{build_conditions(options[:conditions])}" : ''
+          order      = options[:order]      ? " ORDER BY #{options[:order]}"                     : ''
+          limit      = options[:limit]      ? " LIMIT #{options[:limit]}"                        : ''
+          # mix sort by argument (it must present in response)
+          unless order.blank?
+            sort_by, sort_order = sort_options(options[:order])
+            conditions << (conditions.blank? ? " WHERE " : " AND ") << "(#{sort_by} IS NOT NULL)"
+          end
+          "SELECT #{select} FROM #{from}#{conditions}#{order}#{limit}"
+        end
+
+        def build_conditions(conditions) # :nodoc:
+          case
+          when conditions.is_a?(Array) then connection.query_expression_from_array(conditions)
+          when conditions.is_a?(Hash)  then connection.query_expression_from_hash(conditions)
+          else                              conditions
+          end
+        end
+
       end
       
       public
@@ -617,7 +844,15 @@ module RightAws
         attrs.delete('id')
         unless attrs.blank?
           connection.delete_attributes(domain, id, attrs)
-          attrs.each { |attribute, values| @attributes[attribute] -= values }
+          attrs.each do |attribute, values|
+            # remove the values from the attribute
+            if @attributes[attribute]
+              @attributes[attribute] -= values
+            else
+              # if the attribute is unknown remove it from a resulting list of fixed attributes
+              attrs.delete(attribute)
+            end
+          end
         end
         attrs
       end

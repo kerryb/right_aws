@@ -107,6 +107,10 @@ class TestSdb < Test::Unit::TestCase
     assert_raise(RightAws::ActiveSdb::ActiveSdbError) do 
       Client.find(ids)
     end
+    # find one record by unknown id
+    assert_raise(RightAws::ActiveSdb::ActiveSdbError) do
+      Client.find('dummy_id')
+    end
   end
 
   def test_05_find_first
@@ -127,6 +131,11 @@ class TestSdb < Test::Unit::TestCase
     assert_equal 2, Client.find_all_by_post_and_country('president','Russia').size
     # find all women in USA that love flowers
     assert_equal 2, Client.find_all_by_gender_and_country_and_hobby('female','Russia','flowers').size
+    # order and auto_load:
+    clients = Client.find_all_by_post('president', :order => 'name', :auto_load => true)
+    assert_equal [['Bush'], ['Medvedev'], ['Putin']], clients.map{|c| c['name']}
+    clients = Client.find_all_by_post('president', :order => 'name desc', :auto_load => true)
+    assert_equal [['Putin'], ['Medvedev'], ['Bush']], clients.map{|c| c['name']}
   end
   
   def test_07_find_by_helpers
@@ -135,9 +144,11 @@ class TestSdb < Test::Unit::TestCase
     # find any russian president
     assert Client.find_by_post_and_country('president','Russia')
     # find Mary in Russia that loves flowers
-    assert Client.find_by_gender_and_country_and_hobby('female','Russia','flowers')
+    # order and auto_load:
+    assert_equal ['Bush'],  Client.find_by_post('president', :order => 'name',      :auto_load => true)['name']
+    assert_equal ['Putin'], Client.find_by_post('president', :order => 'name desc', :auto_load => true)['name']
   end
-  
+
   def test_08_reload
     putin = Client.find_by_name('Putin')
     # attributes must be empty until reload (except 'id' field)
@@ -156,9 +167,44 @@ class TestSdb < Test::Unit::TestCase
     assert_equal ['2008'],      putin['expiration']
     assert_equal ['president'], putin['post']
   end
+
+  def test_09_select
+    # select all records
+    assert_equal 7, Client.select(:all).size
+    # LIMIT
+    # 1 record
+    assert Client.select(:first).is_a?(Client)
+    # select 2 recs
+    assert_equal 2, Client.select(:all, :limit => 2).size
+    # ORDER
+    # select all recs ordered by 'expration' (must find only recs where 'expration' attribute presents)
+    result = Client.select(:all, :order => 'expiration')
+    assert_equal 3, result.size
+    assert_equal ['2008', '2009', '2012'], result.map{ |c| c['expiration'] }.flatten
+    # desc order
+    result = Client.select(:all, :order => 'expiration desc')
+    assert_equal ['2012', '2009', '2008'], result.map{ |c| c['expiration'] }.flatten
+    # CONDITIONS
+    result = Client.select(:all, :conditions => ["expiration >= ?", 2009], :order => 'name')
+    assert_equal ['Bush', 'Medvedev'], result.map{ |c| c['name'] }.flatten
+    result = Client.select(:all, :conditions => "hobby='flowers' AND gender='female'", :order => 'name')
+    assert_equal ['Mary', 'Sandy'], result.map{ |c| c['name'] }.flatten
+    # SELECT
+    result = Client.select(:all, :select => 'hobby', :conditions => "gender IS NOT NULL", :order => 'name')
+    hobbies = result.map{|c| c['hobby']}
+    # must return all recs
+    assert_equal 6, result.size
+    # but anly 3 of them have this field set
+    assert_equal 3, hobbies.compact.size
+  end
+
+  def test_10_select_by
+    assert_equal 2, Client.select_all_by_hobby('flowers').size
+    assert_equal 2, Client.select_all_by_hobby_and_country('flowers', 'Russia').size
+    assert_equal ['Putin'], Client.select_by_post_and_expiration('president','2008')['name']
+  end
   
-  
-  def test_09_save_and_put
+  def test_11_save_and_put
     putin = Client.find_by_name('Putin')
     putin.reload
     putin['hobby'] = 'ski'
@@ -187,7 +233,7 @@ class TestSdb < Test::Unit::TestCase
     assert ['dogs', 'ski'], new_putin['hobby'].sort
   end
 
-  def test_10_save_and_put_attributes
+  def test_12_save_and_put_attributes
     putin = Client.find_by_name('Putin')
     putin.reload
     # SAVE method (replace values)
@@ -213,12 +259,16 @@ class TestSdb < Test::Unit::TestCase
     assert ['english', 'german', 'russian'], new_putin['language'].sort
   end
   
-  def test_11_delete
+  def test_13_delete
     putin = Client.find_by_name('Putin')
     putin.reload
     # --- delete_values
+    # remove an unknown attribute
+    # should return an empty hash
+    assert_equal( {}, putin.delete_values('undefined_attribute' => 'ohoho'))
     # remove 2 languages
-    putin.delete_values('language' => ['english', 'german'])
+    lang_hash = {'language' => ['english', 'german']}
+    assert_equal lang_hash, putin.delete_values(lang_hash)
     wait SDB_DELAY, 'test 11: after put_attributes'
     # now Putin must know only russian lang
     new_putin = Client.find_by_name('Putin')
@@ -226,7 +276,7 @@ class TestSdb < Test::Unit::TestCase
     assert ['russian'], new_putin['language'].sort
     # --- delete_attributes
     putin.delete_attributes('language', 'hobby')
-    wait SDB_DELAY, 'test 11: after put_attributes'
+    wait SDB_DELAY, 'test 11: after delete_attributes'
     # trash hoddy and langs
     new_putin = Client.find_by_name('Putin')
     new_putin.reload
@@ -238,7 +288,7 @@ class TestSdb < Test::Unit::TestCase
     assert_nil Client.find_by_name('Putin')
   end
   
-  def test_12_delete_domain
+  def test_14_delete_domain
     assert Client.delete_domain
     wait SDB_DELAY, 'test 12: after delete domain'
     assert_raise(Rightscale::AwsError) do 

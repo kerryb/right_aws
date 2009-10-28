@@ -24,11 +24,73 @@
 # Test
 module RightAws
   require 'md5'
+  require 'pp'
   
   class AwsUtils #:nodoc:
-    @@digest = OpenSSL::Digest::Digest.new("sha1")
+    @@digest1   = OpenSSL::Digest::Digest.new("sha1")
+    @@digest256 = nil
+    if OpenSSL::OPENSSL_VERSION_NUMBER > 0x00908000
+      @@digest256 = OpenSSL::Digest::Digest.new("sha256") rescue nil # Some installation may not support sha256
+    end
+    
     def self.sign(aws_secret_access_key, auth_string)
-      Base64.encode64(OpenSSL::HMAC.digest(@@digest, aws_secret_access_key, auth_string)).strip
+      Base64.encode64(OpenSSL::HMAC.digest(@@digest1, aws_secret_access_key, auth_string)).strip
+    end
+
+    # Escape a string accordingly Amazon rulles
+    # http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?REST_RESTAuth.html
+    def self.amz_escape(param)
+      param.to_s.gsub(/([^a-zA-Z0-9._~-]+)/n) do
+        '%' + $1.unpack('H2' * $1.size).join('%').upcase
+      end
+    end
+
+    # Set a timestamp and a signature version
+    def self.fix_service_params(service_hash, signature)
+      # Removed hardcoded UTC timezone
+      service_hash["Timestamp"] ||= Time.now.strftime("%Y-%m-%dT%H:%M:%S.000Z") unless service_hash["Expires"]
+      service_hash["SignatureVersion"] = signature
+      service_hash
+    end
+
+    # Signature Version 0
+    # A deprecated guy (should work till septemper 2009)
+    def self.sign_request_v0(aws_secret_access_key, service_hash)
+      fix_service_params(service_hash, '0')
+      string_to_sign = "#{service_hash['Action']}#{service_hash['Timestamp'] || service_hash['Expires']}"
+      service_hash['Signature'] = AwsUtils::sign(aws_secret_access_key, string_to_sign)
+      service_hash.to_a.collect{|key,val| "#{amz_escape(key)}=#{amz_escape(val.to_s)}" }.join("&")
+    end
+
+    # Signature Version 1
+    # Another deprecated guy (should work till septemper 2009)
+    def self.sign_request_v1(aws_secret_access_key, service_hash)
+      fix_service_params(service_hash, '1')
+      string_to_sign = service_hash.sort{|a,b| (a[0].to_s.downcase)<=>(b[0].to_s.downcase)}.to_s
+      service_hash['Signature'] = AwsUtils::sign(aws_secret_access_key, string_to_sign)
+      service_hash.to_a.collect{|key,val| "#{amz_escape(key)}=#{amz_escape(val.to_s)}" }.join("&")
+    end
+
+    # Signature Version 2
+    # EC2, SQS and SDB requests must be signed by this guy.
+    # See:  http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?REST_RESTAuth.html
+    #       http://developer.amazonwebservices.com/connect/entry.jspa?externalID=1928
+    def self.sign_request_v2(aws_secret_access_key, service_hash, http_verb, host, uri)
+      fix_service_params(service_hash, '2')
+      # select a signing method (make an old openssl working with sha1)
+      # make 'HmacSHA256' to be a default one
+      service_hash['SignatureMethod'] = 'HmacSHA256' unless ['HmacSHA256', 'HmacSHA1'].include?(service_hash['SignatureMethod'])
+      service_hash['SignatureMethod'] = 'HmacSHA1'   unless @@digest256
+      # select a digest
+      digest = (service_hash['SignatureMethod'] == 'HmacSHA256' ? @@digest256 : @@digest1)
+      # form string to sign
+      canonical_string = service_hash.keys.sort.map do |key|
+        "#{amz_escape(key)}=#{amz_escape(service_hash[key])}"
+      end.join('&')
+      string_to_sign = "#{http_verb.to_s.upcase}\n#{host.downcase}\n#{uri}\n#{canonical_string}"
+      # sign the string
+      signature      = amz_escape(Base64.encode64(OpenSSL::HMAC.digest(digest, aws_secret_access_key, string_to_sign)).strip)
+      "#{canonical_string}&Signature=#{signature}"
     end
 
     # From Amazon's SQS Dev Guide, a brief description of how to escape:
@@ -43,6 +105,23 @@ module RightAws
     def self.URLencode(raw)
       e = URI.escape(raw)
       e.gsub(/\+/, "%2b")
+    end
+    
+    def self.allow_only(allowed_keys, params)
+      bogus_args = []
+      params.keys.each {|p| bogus_args.push(p) unless allowed_keys.include?(p) }
+      raise AwsError.new("The following arguments were given but are not legal for the function call #{caller_method}: #{bogus_args.inspect}") if bogus_args.length > 0
+    end
+    
+    def self.mandatory_arguments(required_args, params)
+      rargs = required_args.dup
+      params.keys.each {|p| rargs.delete(p)}
+      raise AwsError.new("The following mandatory arguments were not provided to #{caller_method}: #{rargs.inspect}") if rargs.length > 0
+    end
+    
+    def self.caller_method
+      caller[1]=~/`(.*?)'/
+      $1
     end
 
   end
@@ -93,7 +172,7 @@ module RightAws
   end
 
   module RightAwsBaseInterface
-    DEFAULT_SIGNATURE_VERSION = '1'
+    DEFAULT_SIGNATURE_VERSION = '2'
     
     @@caching = false
     def self.caching
@@ -102,7 +181,7 @@ module RightAws
     def self.caching=(caching)
       @@caching = caching
     end
-    
+
       # Current aws_access_key_id
     attr_reader :aws_access_key_id
       # Last HTTP request object
@@ -130,10 +209,20 @@ module RightAws
         if aws_access_key_id.blank? || aws_secret_access_key.blank?
       @aws_access_key_id     = aws_access_key_id
       @aws_secret_access_key = aws_secret_access_key
-      @params[:server]       ||= service_info[:default_host]
-      @params[:port]         ||= service_info[:default_port]
-      @params[:service]      ||= service_info[:default_service]
-      @params[:protocol]     ||= service_info[:default_protocol]
+      # if the endpoint was explicitly defined - then use it
+      if @params[:endpoint_url]
+        @params[:server]   = URI.parse(@params[:endpoint_url]).host
+        @params[:port]     = URI.parse(@params[:endpoint_url]).port
+        @params[:service]  = URI.parse(@params[:endpoint_url]).path
+        @params[:protocol] = URI.parse(@params[:endpoint_url]).scheme
+        @params[:region]   = nil
+      else
+        @params[:server]   ||= service_info[:default_host]
+        @params[:server]     = "#{@params[:region]}.#{@params[:server]}" if @params[:region]
+        @params[:port]     ||= service_info[:default_port]
+        @params[:service]  ||= service_info[:default_service]
+        @params[:protocol] ||= service_info[:default_protocol]
+      end
       @params[:multi_thread] ||= defined?(AWS_DAEMON)
       @logger = @params[:logger]
       @logger = RAILS_DEFAULT_LOGGER if !@logger && defined?(RAILS_DEFAULT_LOGGER)
@@ -142,6 +231,15 @@ module RightAws
       @error_handler = nil
       @cache = {}
       @signature_version = (params[:signature_version] || DEFAULT_SIGNATURE_VERSION).to_s
+    end
+
+    def signed_service_params(aws_secret_access_key, service_hash, http_verb=nil, host=nil, service=nil )
+      case signature_version.to_s
+      when '0' then AwsUtils::sign_request_v0(aws_secret_access_key, service_hash)
+      when '1' then AwsUtils::sign_request_v1(aws_secret_access_key, service_hash)
+      when '2' then AwsUtils::sign_request_v2(aws_secret_access_key, service_hash, http_verb, host, service)
+      else raise AwsError.new("Unknown signature version (#{signature_version.to_s}) requested")
+      end
     end
 
     # Returns +true+ if the describe_xxx responses are being cached 
@@ -157,10 +255,13 @@ module RightAws
     def cache_hits?(function, response, do_raise=:raise)
       result = false
       if caching?
-        function     = function.to_sym
+        function = function.to_sym
+        # get rid of requestId (this bad boy was added for API 2008-08-08+ and it is uniq for every response)
+        response = response.sub(%r{<requestId>.+?</requestId>}, '')
         response_md5 = MD5.md5(response).to_s
-        # well, the response is new, reset cache data
+        # check for changes
         unless @cache[function] && @cache[function][:response_md5] == response_md5
+          # well, the response is new, reset cache data
           update_cache(function, {:response_md5 => response_md5, 
                                   :timestamp    => Time.now, 
                                   :hits         => 0, 
@@ -262,6 +363,27 @@ module RightAws
     rescue
       @error_handler = nil
       raise
+    end
+
+    def request_cache_or_info(method, link, parser_class, benchblock, use_cache=true) #:nodoc:
+      # We do not want to break the logic of parsing hence will use a dummy parser to process all the standard
+      # steps (errors checking etc). The dummy parser does nothig - just returns back the params it received.
+      # If the caching is enabled and hit then throw  AwsNoChange.
+      # P.S. caching works for the whole images list only! (when the list param is blank)
+      # check cache
+      response, params = request_info(link, RightDummyParser.new)
+      cache_hits?(method.to_sym, response.body) if use_cache
+      parser = parser_class.new(:logger => @logger)
+      benchblock.xml.add!{ parser.parse(response, params) }
+      result = block_given? ? yield(parser) : parser.result
+      # update parsed data
+      update_cache(method.to_sym, :parsed => result) if use_cache
+      result
+    end
+
+    # Returns Amazons request ID for the latest request
+    def last_request_id
+      @last_response && @last_response.body.to_s[%r{<requestId>(.+?)</requestId>}] && $1
     end
 
   end
@@ -550,8 +672,9 @@ module RightAws
       @xmlpath += @xmlpath.empty? ? name : "/#{name}"
     end
     def tag_end(name)
-      @xmlpath[/^(.*?)\/?#{name}$/]
-      @xmlpath = $1
+      if @xmlpath =~ /^(.*?)\/?#{name}$/
+        @xmlpath = $1
+      end
       tagend(name)
     end
     def text(text)
@@ -653,6 +776,21 @@ module RightAws
     end
     def reset
       @errors = []
+    end
+  end
+
+  # Dummy parser - does nothing
+  # Returns the original params back
+  class RightDummyParser  # :nodoc:
+    attr_accessor :result
+    def parse(response, params={})
+      @result = [response, params]
+    end
+  end
+
+  class RightHttp2xxParser < RightAWSParser # :nodoc:
+    def parse(response)
+      @result = response.is_a?(Net::HTTPSuccess)
     end
   end
 

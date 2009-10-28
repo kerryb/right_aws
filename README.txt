@@ -5,17 +5,21 @@ For information about RightScale, see http://www.rightscale.com
 
 == DESCRIPTION:
 
-The RightScale AWS gems have been designed to provide a robust, fast, and secure interface to Amazon EC2, Amazon S3, Amazon SQS, and Amazon SDB. These gems have been used in production by RightScale since late 2006 and are being maintained to track enhancements made by Amazon. The RightScale AWS gems comprise:
+The RightScale AWS gems have been designed to provide a robust, fast, and secure interface to Amazon EC2, EBS, S3, SQS, SDB, and CloudFront. 
+These gems have been used in production by RightScale since late 2006 and are being maintained to track enhancements made by Amazon. 
+The RightScale AWS gems comprise:
 
-- RightAws::Ec2 -- interface to Amazon EC2 (Elastic Compute Cloud)
+- RightAws::Ec2 -- interface to Amazon EC2 (Elastic Compute Cloud) and the
+  associated EBS (Elastic Block Store)
 - RightAws::S3 and RightAws::S3Interface -- interface to Amazon S3 (Simple Storage Service)
 - RightAws::Sqs and RightAws::SqsInterface -- interface to first-generation Amazon SQS (Simple Queue Service) (API version 2007-05-01)
 - RightAws::SqsGen2 and RightAws::SqsGen2Interface -- interface to second-generation Amazon SQS (Simple Queue Service) (API version 2008-01-01)
 - RightAws::SdbInterface and RightAws::ActiveSdb -- interface to Amazon SDB (SimpleDB)
+- RightAws::AcfInterface -- interface to Amazon CloudFront, a content distribution service
 
 == FEATURES:
 
-- Full programmmatic access to EC2, S3, SQS, and SDB.
+- Full programmmatic access to EC2, EBS, S3, SQS, SDB, and CloudFront.
 - Complete error handling: all operations check for errors and report complete
   error information by raising an AwsError.
 - Persistent HTTP connections with robust network-level retry layer using
@@ -34,7 +38,7 @@ The RightScale AWS gems have been designed to provide a robust, fast, and secure
   AWS accounts.
 - Support for both first- and second-generation SQS (API versions 2007-05-01
   and 2008-01-01).  These versions of SQS are not compatible.
-- Support for signature versions 0 and 1 on SQS, SDB, and EC2.
+- Support for signature versions 0, 1 and 2 on all services.
 - Interoperability with any cloud running Eucalyptus (http://eucalyptus.cs.ucsb.edu)
 - Test suite (requires AWS account to do "live" testing).
 
@@ -61,7 +65,7 @@ concurrent requests to AWS. The way this plays out in practice is:
 Note that due to limitations in the I/O of the Ruby interpreter you
 may not get the degree of parallelism you may expect with the multi-threaded setting.
 
-By default, EC2/S3/SQS/SDB interface instances are created in single-threaded mode.  Set
+By default, EC2/S3/SQS/SDB/ACF interface instances are created in single-threaded mode.  Set
 "params[:multi_thread]" to "true" in the initialization arguments to use
 multithreaded mode.
 
@@ -81,8 +85,22 @@ multithreaded mode.
   http://developer.amazonwebservices.com/connect/entry.jspa?externalID=1148
 * For SDB read RightAws::SdbInterface, RightAws::ActiveSdb, and consult the Amazon SDB API documentation at
   http://developer.amazonwebservices.com/connect/kbcategory.jspa?categoryID=141
+* For CloudFront (ACF) read RightAws::AcfInterface and consult the Amazon CloudFront API documentation at 
+  http://developer.amazonwebservices.com/connect/kbcategory.jspa?categoryID=213
 
 == KNOWN ISSUES:
+
+- 7/08: A user has reported that uploads of large files on Windows may be broken on some
+  Win platforms due to a buggy File.lstat.size.  Use the following monkey-patch at your own risk, 
+  as it has been proven to break Rails 2.0 on Windows:
+
+    require 'win32/file'
+    class File
+      def lstat
+        self.stat
+      end
+    end
+
 
 - Attempting to use the Gibberish plugin (used by the Beast forum app) 
   will break right_aws as well as lots of other code.  Gibberish
@@ -101,7 +119,9 @@ multithreaded mode.
   'incompatible Net::HTTP monkey-patch'
 
   This is due to a conflict between the right_http_connection gem and another
-  gem required by attachment_fu.
+  gem required by attachment_fu.  It may be possible to require right_aws (and
+  thus right_http_connection) in the .after_initialize method of the config object in
+  environment.rb (check the docs for Rails::Configuration.after_initialize).
 
 - 8/07: Amazon has changed the semantics of the SQS service.  A
   new queue may not be created within 60 seconds of the destruction of any
@@ -111,7 +131,7 @@ multithreaded mode.
   
 == REQUIREMENTS:
 
-RightAws requires REXML and the RightHttpConnection gem.
+RightAws requires REXML and the right_http_connection gem.
 If libxml and its Ruby bindings (distributed in the libxml-ruby gem) are
 present, RightAws can be configured to use them:
   RightAws::RightAWSParser.xml_lib = 'libxml'
@@ -124,7 +144,7 @@ sudo gem install right_aws
 
 == LICENSE:
 
-Copyright (c) 2007-2008 RightScale, Inc. 
+Copyright (c) 2007-2009 RightScale, Inc. 
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
